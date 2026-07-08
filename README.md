@@ -11,15 +11,16 @@ A transcrição é feita uma vez; depois você aplica quantos objetivos quiser n
 
 ---
 
-## Instalação no Windows (DaVinci Resolve **Studio**)
+## Instalação no Windows (DaVinci Resolve Studio **e** Adobe Premiere Pro)
 
-> Único pré-requisito que você precisa ter: **DaVinci Resolve Studio** (a versão gratuita não permite automação) e uma **chave da OpenAI**.
+> Um instalador único configura os **dois editores** na mesma máquina.
+> Único pré-requisito que você precisa ter: **DaVinci Resolve Studio** (a versão gratuita não permite automação) e/ou **Adobe Premiere Pro**, mais uma **chave da OpenAI**.
 > O instalador baixa e instala sozinho tudo o mais (Git, Python, ffmpeg).
 
-**Passo único** — salve o `install-windows.ps1` numa pasta e, no PowerShell, rode:
+**Passo único** — no PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
+irm https://raw.githubusercontent.com/lorransouzatreinamentos/viralcut/main/install-windows.ps1 | iex
 ```
 
 Ele vai:
@@ -27,18 +28,24 @@ Ele vai:
 2. Baixar o VIRALCUT para `C:\Users\<você>\viralcut`.
 3. Montar o ambiente Python e instalar as dependências.
 4. Pedir a **chave da OpenAI** e salvá-la.
-5. Criar um atalho **VIRALCUT** na área de trabalho.
-
-> Se o repositório for privado, você precisa estar convidado como colaborador — o Git pede login no navegador na hora de baixar.
+5. **Instalar o painel do Adobe Premiere Pro** (pasta de extensões CEP do usuário + registro `PlayerDebugMode`).
+6. Criar um atalho **VIRALCUT** na área de trabalho (para o fluxo DaVinci).
 
 **No DaVinci Resolve**, uma vez só: `Preferences > System > General > External scripting using = **Local**`.
 
-**Usar:**
+**No Adobe Premiere Pro**, uma vez só: se ele já estava aberto durante a instalação, **feche e abra de novo** (o painel só aparece após reiniciar).
+
+**Usar no DaVinci:**
 1. Abra o Resolve (Studio) com um projeto e uma timeline.
 2. Clique no atalho **VIRALCUT** na área de trabalho — o app abre no navegador.
 3. Selecionar sequência → Analisar → escolher objetivo → Aplicar.
 
-**Atualizar:** clique na **logo ✂ VIRALCUT** no topo do app — ele puxa a versão nova do GitHub e recarrega sozinho.
+**Usar no Premiere:**
+1. Abra o Premiere com um projeto e uma sequência.
+2. Menu **Window > Extensions > VIRALCUT**.
+3. Selecionar sequência → Analisar → escolher objetivo → Aplicar.
+
+**Atualizar (nos dois):** clique na **logo ✂ VIRALCUT** no topo do app — ele puxa a versão nova do GitHub e recarrega sozinho. No Premiere, feche e reabra o painel depois.
 
 ---
 
@@ -63,7 +70,7 @@ Reiniciar o Premiere → **Window > Extensions > VIRALCUT**.
 | `core/adapters/davinci.py` | Fala com a API do Resolve (source path + criar timelines) |
 | `premiere-panel/` | Painel CEP do Premiere (Node self-contained) |
 | `ui/` | Interface compartilhada (servida pelo Core no DaVinci) |
-| `install-windows.ps1` · `viralcut.bat` | Instalador e launcher Windows (DaVinci) |
+| `install-windows.ps1` · `viralcut.bat` | Instalador Windows (DaVinci + Premiere) e launcher (DaVinci) |
 | `tests/` | 47 testes unitários + e2e |
 
 ## Log

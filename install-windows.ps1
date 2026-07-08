@@ -1,8 +1,10 @@
 # =====================================================================
-#  VIRALCUT - instalador completo (Windows + DaVinci Resolve Studio)
+#  VIRALCUT - instalador completo (Windows)
+#  Suporta DaVinci Resolve Studio E Adobe Premiere Pro no mesmo instalador.
 #
 #  Instala TUDO que falta (Git, Python, ffmpeg), baixa o app, configura
-#  o ambiente e cria um atalho na area de trabalho.
+#  o ambiente, instala o painel do Premiere e cria um atalho na area de
+#  trabalho para o DaVinci.
 #
 #  Como rodar (PowerShell, como usuario normal):
 #     powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
@@ -34,7 +36,7 @@ Say "   VIRALCUT - instalacao automatica" "Cyan"
 Say "=====================================" "Cyan"
 
 # ---------------------------------------------------------------------
-Step "1/5  Verificando o winget (gerenciador de pacotes do Windows)"
+Step "1/6  Verificando o winget (gerenciador de pacotes do Windows)"
 if (-not (Have winget)) {
     Say "winget nao encontrado." "Red"
     Say "Instale o 'App Installer' pela Microsoft Store e rode este script de novo." "Yellow"
@@ -43,7 +45,7 @@ if (-not (Have winget)) {
 Say "  [ok] winget disponivel" "Green"
 
 # ---------------------------------------------------------------------
-Step "2/5  Instalando os programas necessarios"
+Step "2/6  Instalando os programas necessarios"
 Ensure "git"    "Git.Git"     "Git"
 Ensure "ffmpeg" "Gyan.FFmpeg" "ffmpeg (extrai o audio do video)"
 
@@ -72,7 +74,7 @@ if (-not $PY) {
 Say "  [ok] Python encontrado ($PY)" "Green"
 
 # ---------------------------------------------------------------------
-Step "3/5  Baixando o VIRALCUT"
+Step "3/6  Baixando o VIRALCUT"
 # Se este script ja esta dentro do repo (usuario clonou antes), usa essa pasta.
 if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "requirements.txt"))) {
     $Dest = $PSScriptRoot
@@ -98,14 +100,14 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "requirements.txt")))
 Set-Location $Dest
 
 # ---------------------------------------------------------------------
-Step "4/5  Preparando o ambiente Python"
+Step "4/6  Preparando o ambiente Python"
 if (-not (Test-Path ".venv")) { & $PY -m venv .venv }
 & .\.venv\Scripts\python.exe -m pip install --quiet --upgrade pip
 & .\.venv\Scripts\pip.exe install --quiet -r requirements.txt
 Say "  [ok] dependencias instaladas" "Green"
 
 # ---------------------------------------------------------------------
-Step "5/5  Configurando a chave da OpenAI"
+Step "5/6  Configurando a chave da OpenAI"
 $VcDir   = Join-Path $env:USERPROFILE ".viralcut"
 $EnvFile = Join-Path $VcDir ".env"
 New-Item -ItemType Directory -Force -Path $VcDir | Out-Null
@@ -116,6 +118,50 @@ if (Test-Path $EnvFile) {
     $content = "OPENAI_API_KEY=$key`r`nVIRALCUT_LLM=openai`r`nVIRALCUT_LLM_MODEL=gpt-4o`r`n"
     [System.IO.File]::WriteAllText($EnvFile, $content, (New-Object System.Text.UTF8Encoding($false)))
     Say "  [ok] chave salva" "Green"
+}
+
+# ---------------------------------------------------------------------
+Step "6/6  Instalando o painel do Adobe Premiere Pro"
+# Mesma logica do instalador Mac (scripts/install-premiere.sh), adaptada para
+# Windows: bundle ExtendScript concatenado (o @include do CEP nao carrega de
+# forma confiavel) + PlayerDebugMode via registro (equivalente ao 'defaults
+# write' do macOS) + copia para a pasta de extensoes CEP do usuario.
+$PremiereOK = $false
+try {
+    $Panel   = Join-Path $Dest "premiere-panel"
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $PVersion = "V." + (Get-Date -Format "dd.MM.yy.HH.mm")
+
+    [System.IO.File]::WriteAllText((Join-Path $Panel "client\version.js"), "window.__VIRALCUT_VERSION = `"$PVersion`";`n", $Utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $Panel "host\version.jsx"), "var VIRALCUT_BUILD = `"$PVersion`";`n", $Utf8NoBom)
+
+    # Bundle: concatena json2 + version + timeline num UNICO arquivo (VIRALCUT
+    # fica definido INLINE, nao via @include -- mesmo motivo do Mac).
+    $bundleText = (Get-Content (Join-Path $Panel "host\json2.jsx") -Raw) + "`n" +
+                  (Get-Content (Join-Path $Panel "host\version.jsx") -Raw) + "`n" +
+                  (Get-Content (Join-Path $Panel "host\timeline.jsx") -Raw)
+    [System.IO.File]::WriteAllText((Join-Path $Panel "host\bundle.jsx"), $bundleText, $Utf8NoBom)
+
+    # app.js identico ao da UI compartilhada (fonte unica de logica)
+    Copy-Item (Join-Path $Dest "ui\app.js") (Join-Path $Panel "client\app.js") -Force
+
+    # PlayerDebugMode via registro do usuario (nao precisa de admin/HKLM)
+    foreach ($csxs in 9, 10, 11, 12) {
+        $regKey = "HKCU:\Software\Adobe\CSXS.$csxs"
+        New-Item -Path $regKey -Force | Out-Null
+        New-ItemProperty -Path $regKey -Name "PlayerDebugMode" -Value "1" -PropertyType String -Force | Out-Null
+    }
+
+    # Copia o painel para a pasta de extensoes CEP (por usuario, sem admin)
+    $CepDest = Join-Path $env:APPDATA "Adobe\CEP\extensions\VIRALCUT"
+    if (Test-Path $CepDest) { Remove-Item $CepDest -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $CepDest | Out-Null
+    Copy-Item (Join-Path $Panel "*") $CepDest -Recurse -Force
+
+    Say "  [ok] painel Premiere instalado ($PVersion)" "Green"
+    $PremiereOK = $true
+} catch {
+    Say "  [aviso] nao consegui instalar o painel do Premiere: $($_.Exception.Message)" "Yellow"
 }
 
 # ---------------------------------------------------------------------
@@ -134,14 +180,24 @@ try {
 Say "`n=====================================" "Green"
 Say "   PRONTO!" "Green"
 Say "=====================================" "Green"
-Say ""
-Say "Falta so 1 ajuste no DaVinci (uma vez so):" "White"
-Say "  Preferences > System > General >" "White"
-Say "  'External scripting using' = Local" "Yellow"
-Say ""
+
+Say "`n--- DAVINCI RESOLVE ---" "Cyan"
+Say "Ajuste unico (uma vez so):" "White"
+Say "  Preferences > System > General > 'External scripting using' = Local" "Yellow"
 Say "Para usar:" "White"
 Say "  1. Abra o DaVinci Resolve (Studio) com um projeto e uma timeline" "White"
 Say "  2. Clique no atalho VIRALCUT na area de trabalho" "White"
 Say "  3. O app abre no navegador. Selecionar -> Analisar -> Objetivo -> Aplicar" "White"
-Say ""
-Say "Para atualizar depois: clique na logo do app (canto superior esquerdo)." "DarkGray"
+
+if ($PremiereOK) {
+    Say "`n--- ADOBE PREMIERE PRO ---" "Cyan"
+    Say "Ajuste unico (uma vez so, se o Premiere ja estiver aberto):" "White"
+    Say "  FECHE o Premiere Pro e abra de novo (o painel novo so aparece apos reiniciar)" "Yellow"
+    Say "Para usar:" "White"
+    Say "  1. Abra o Premiere com um projeto e uma sequencia" "White"
+    Say "  2. Menu Window > Extensions > VIRALCUT" "White"
+    Say "  3. Selecionar -> Analisar -> Objetivo -> Aplicar" "White"
+}
+
+Say "`nPara atualizar depois: clique na logo do app (canto superior esquerdo)." "DarkGray"
+Say "No Premiere, apos atualizar, feche e reabra o painel (Window > Extensions)." "DarkGray"
