@@ -89,7 +89,7 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
 
 ## SCORE — AUMENTAM: hook forte (maior peso), autossuficiência (entende sem o resto do vídeo, sem pronome órfão), gatilho emocional, contra-intuição, especificidade (números/exemplos/história), identificação, motivo de compartilhamento, payoff satisfatório. REDUZEM: trecho morno, contexto-dependente, arrastado, sem conclusão, genérico, abertura fraca.
 
-## DURAÇÃO: ~15 a ~90s. Priorize SEMPRE completude narrativa sobre duração exata. Um corte de 22s completo vale mais que 60s que corta no meio.
+## DURAÇÃO — REGRA RÍGIDA: a faixa de duração vem no pedido do usuário e é OBRIGATÓRIA. Um corte fora dessa faixa é DESCARTADO automaticamente pelo sistema, então nem proponha. Se um trecho bom é curto demais, ESTENDA-O incluindo os segmentos vizinhos que completam o raciocínio (o contexto que leva à frase, ou a conclusão que vem depois) até entrar na faixa. Se não houver como estender mantendo sentido, não proponha esse corte. Dentro da faixa, priorize completude narrativa.
 
 ## FRONTEIRAS: comece no segmento que contém o GANCHO (corte o aquecimento anterior); termine no segmento que fecha a ideia (conclusão/respiro/frase de efeito). start_seg_id < end_seg_id. Nunca termine em conjunção ("porque...", "e aí...", "mas...").
 
@@ -342,8 +342,12 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   var PADDING = 0.08;
   var COLOR_CYCLE = [9, 8, 7, 13, 6, 10, 4, 5]; // indices de label do Premiere
 
-  function resolveClips(raw, transcript) {
+  // ENFORCEMENT de duracao em CODIGO, nao so no prompt. A IA ignora instrucoes
+  // de duracao com frequencia -- entao o corte que sai da faixa e descartado
+  // aqui, na resolucao. E isso que impede "corte de 15s sem sentido".
+  function resolveClips(raw, transcript, minDur, maxDur) {
     var out = [];
+    var rejected = { curto: 0, longo: 0 };
     for (var i = 0; i < raw.length; i++) {
       var r = raw[i];
       var sSeg = segById(transcript, r.start_seg_id);
@@ -360,6 +364,10 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
       var start = Math.max(0, w0.start - PADDING);
       var end = w1.end + PADDING;
       if (end <= start) continue;
+
+      var dur = end - start;
+      if (minDur && dur < minDur) { rejected.curto++; continue; }
+      if (maxDur && dur > maxDur) { rejected.longo++; continue; }
 
       // texto para exibir: usa o texto dos SEGMENTOS (completo), nao a
       // reconstrucao a partir das palavras (o array de words do Whisper as vezes
@@ -383,15 +391,29 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
       });
     }
     out.sort(function (a, b) { return b.score - a.score; });
+    out._rejected = rejected;
     return out;
   }
 
   // ---------------------------------------------------------------------------
   // Plano de cortes p/ ExtendScript (ticks, snapados no frame)
   // ---------------------------------------------------------------------------
-  function secToTicks(sec, fps) {
-    var frame = Math.round(sec * fps);
+  // Arredondamento DIRECIONAL: o corte nunca pode encolher.
+  //   entrada -> floor (nunca comeca depois do ponto pedido)
+  //   saida   -> ceil  (nunca termina antes -- era isto que comia a silaba final)
+  // Math.round nos dois lados podia perder ate meio frame em cada ponta.
+  function frameToTicks(frame, fps) {
     return String(Math.round(frame * TICKS_PER_SEC / fps));
+  }
+  function secToTicksIn(sec, fps) {
+    return frameToTicks(Math.floor(sec * fps), fps);
+  }
+  function secToTicksOut(sec, fps) {
+    return frameToTicks(Math.ceil(sec * fps), fps);
+  }
+  // compat: usado por testes antigos
+  function secToTicks(sec, fps) {
+    return frameToTicks(Math.round(sec * fps), fps);
   }
 
   function buildCutPlan(clips, source, seqName) {
@@ -402,8 +424,8 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
         id: c.id,
         titulo: c.titulo,
         project_item_id: source.project_item_id,
-        in_ticks: secToTicks(c.start, source.fps),
-        out_ticks: secToTicks(c.end, source.fps),
+        in_ticks: secToTicksIn(c.start, source.fps),
+        out_ticks: secToTicksOut(c.end, source.fps),
         label_index: c.color_index
       });
     }
@@ -429,7 +451,7 @@ A montagem tem que soar como UMA fala contínua e proposital.
 ## HONESTIDADE: recombine a ORDEM, mas nunca distorça o que a pessoa disse. Só use texto que existe na transcrição.
 
 ## TAMANHO: cada montagem tem de 3 a 6 blocos (MÁXIMO 6). Menos é mais — uma montagem enxuta e afiada vale mais que uma colcha de retalhos. Nunca passe de 6.
-## DURAÇÃO: ~15 a ~90s. Coerência do arco acima de duração.
+## DURAÇÃO: a faixa vem no pedido do usuário e é OBRIGATÓRIA — some as durações dos segmentos que escolher e fique dentro dela. Se a montagem ficar curta, adicione mais um bloco que aprofunde o argumento. Coerência do arco acima de tudo.
 ## Só entregue montagens genuinamente mais fortes que um corte linear (score acima de ~65). Prefira 1-3 montagens excelentes a muitas medianas. Ordene do maior score para o menor. Use a ferramenta propose_montages.`;
 
   var MONTAGE_SCHEMA = {
@@ -478,16 +500,23 @@ A montagem tem que soar como UMA fala contínua e proposital.
     };
   }
 
-  function buildMontagePlan(montage, source, seqName) {
+  // Cada montagem inteira usa UMA cor (todos os trechos dela na mesma cor);
+  // montagens diferentes usam cores diferentes. Usa a cor ja atribuida na
+  // montagem (frankenbite) para que preview e timeline batam -- o indice da
+  // lista SELECIONADA nao corresponde ao da lista completa.
+  function buildMontagePlan(montage, source, seqName, montageIndex) {
+    var color = typeof montage.color_index === "number"
+      ? montage.color_index
+      : COLOR_CYCLE[(montageIndex || 0) % COLOR_CYCLE.length];
     var cuts = [];
     for (var i = 0; i < montage.pieces.length; i++) {
       var p = montage.pieces[i];
       cuts.push({
         id: montage.id + "_" + i, titulo: montage.titulo,
         project_item_id: source.project_item_id,
-        in_ticks: secToTicks(p.start, source.fps),
-        out_ticks: secToTicks(p.end, source.fps),
-        label_index: 8
+        in_ticks: secToTicksIn(p.start, source.fps),
+        out_ticks: secToTicksOut(p.end, source.fps),
+        label_index: color
       });
     }
     return { new_sequence_name: seqName, cuts: cuts };
@@ -507,6 +536,33 @@ A montagem tem que soar como UMA fala contínua e proposital.
     }
     if (cur) spans.push(cur);
     return spans;
+  }
+
+  // Padding ADAPTATIVO. O `end` que o Whisper reporta e o fim do fonema, nao da
+  // cauda audivel do som -- cortar logo depois come a silaba final. Aqui damos
+  // folga no fim de cada fala usando o silencio REAL disponivel ate a proxima,
+  // sem nunca invadi-la. (Antes era um fixo de 0.03s, pequeno demais: as folgas
+  // reais medidas ficam entre 0.20s e 0.46s.)
+  var HEAD_PAD_MAX = 0.10;  // respiro antes da fala
+  var TAIL_PAD_MAX = 0.25;  // cauda depois da fala (o que estava comendo palavra)
+  var TAIL_PAD_RATIO = 0.8; // usa ate 80% da folga -- ainda remove a maior parte do silencio
+
+  function padSpans(spans, durationSec) {
+    var out = [];
+    for (var i = 0; i < spans.length; i++) {
+      var s = spans[i];
+      var prevEnd = i > 0 ? spans[i - 1].end : 0;
+      var nextStart = i < spans.length - 1 ? spans[i + 1].start : (durationSec || (s.end + TAIL_PAD_MAX));
+
+      var headroom = Math.max(0, s.start - prevEnd);
+      var tailroom = Math.max(0, nextStart - s.end);
+
+      var head = Math.min(HEAD_PAD_MAX, headroom * 0.5);
+      var tail = Math.min(TAIL_PAD_MAX, tailroom * TAIL_PAD_RATIO);
+
+      out.push({ start: Math.max(0, s.start - head), end: s.end + tail });
+    }
+    return out;
   }
 
   // ===========================================================================
@@ -544,27 +600,40 @@ A montagem tem que soar como UMA fala contínua e proposital.
   async function viralCuts(transcript, source, opts) {
     opts = opts || {};
     var apiKey = readOpenAIKey();
-    var sink = { type: "viral" };
-    var user = buildUserPrompt(transcript, opts.minScore || 45, opts.maxClips || 12, opts.minDur || 15, opts.maxDur || 90);
+    var minDur = opts.minDur || 30;
+    var maxDur = opts.maxDur || 90;
+    var sink = { type: "viral", min_dur: minDur, max_dur: maxDur };
+    var user = buildUserPrompt(transcript, opts.minScore || 45, opts.maxClips || 12, minDur, maxDur);
     var out = await gptCall(apiKey, SYSTEM_PROMPT_VIRAL, user, "propose_clips", CLIP_SCHEMA, sink);
-    var clips = resolveClips(out.clips || [], transcript);
-    sink.resolved = clips.map(function (c) { return { titulo: c.titulo, score: c.score, start: c.start, end: c.end, text: c.text }; });
-    sink.summary = clips.length + " cortes virais";
+    // enforcement em codigo: a IA nao respeita duracao de forma confiavel
+    var clips = resolveClips(out.clips || [], transcript, minDur, maxDur);
+    var rej = clips._rejected || { curto: 0, longo: 0 };
+    sink.rejeitados = rej;
+    sink.resolved = clips.map(function (c) { return { titulo: c.titulo, score: c.score, start: c.start, end: c.end, dur: +(c.end - c.start).toFixed(1), text: c.text }; });
+    sink.summary = clips.length + " cortes (" + minDur + "-" + maxDur + "s) | descartados: " +
+      rej.curto + " curtos, " + rej.longo + " longos";
     logObjective(sink);
-    return { clips: clips };
+    return { clips: clips, rejected: rej, minDur: minDur, maxDur: maxDur };
   }
+
+  var COLOR_NAMES = ["Azul", "Roxo", "Laranja", "Verde", "Rosa", "Ciano", "Amarelo", "Marinho"];
 
   async function frankenbite(transcript, source, opts) {
     opts = opts || {};
     var apiKey = readOpenAIKey();
-    var sink = { type: "frankenbite" };
+    var nVideos = opts.nVideos || opts.maxClips || 3;   // quantos videos montados o usuario quer
+    var minDur = opts.minDur || 30;
+    var maxDur = opts.maxDur || 90;
+    var sink = { type: "frankenbite", pedidos: nVideos, min_dur: minDur, max_dur: maxDur };
     var segLines = [];
     for (var si = 0; si < transcript.segments.length; si++) {
       var s = transcript.segments[si];
       segLines.push("[seg " + s.id + " | " + s.start.toFixed(1) + "-" + s.end.toFixed(1) + "] " + s.text);
     }
-    var user = "MÁX MONTAGENS: " + (opts.maxClips || 3) + ". DURAÇÃO ALVO: " + (opts.minDur || 15) +
-      "-" + (opts.maxDur || 90) + "s.\n\nTRANSCRIÇÃO (id | tempo | texto):\n" + segLines.join("\n") +
+    var user = "QUANTIDADE DE MONTAGENS PEDIDA: " + nVideos + " (entregue exatamente esse numero se houver material; " +
+      "se nao houver material bom o bastante, entregue menos, nunca mais).\nDURAÇÃO DE CADA MONTAGEM: " +
+      minDur + "-" + maxDur + "s (some as duracoes dos segmentos escolhidos).\n\nTRANSCRIÇÃO (id | tempo | texto):\n" +
+      segLines.join("\n") +
       "\n\nCrie montagens costurando segmentos de momentos diferentes numa narrativa nova e mais forte. " +
       "Cada montagem é uma lista ORDENADA de ids (ordem de reprodução). Ordene as montagens por score.";
     var out = await gptCall(apiKey, SYSTEM_PROMPT_MONTAGE, user, "propose_montages", MONTAGE_SCHEMA, sink);
@@ -572,8 +641,14 @@ A montagem tem que soar como UMA fala contínua e proposital.
     var montages = [];
     for (var i = 0; i < raw.length; i++) { var m = resolveMontage(raw[i], transcript, i); if (m) montages.push(m); }
     montages.sort(function (a, b) { return b.score - a.score; });
-    sink.resolved = montages.map(function (m) { return { titulo: m.titulo, score: m.score, pieces: m.pieces.length, text: m.text }; });
-    sink.summary = montages.length + " montagens";
+    montages = montages.slice(0, nVideos);              // respeita a quantidade pedida
+    // cada montagem inteira ganha 1 cor propria (usada na timeline e no preview)
+    for (var k = 0; k < montages.length; k++) {
+      montages[k].color_index = COLOR_CYCLE[k % COLOR_CYCLE.length];
+      montages[k].color_name = COLOR_NAMES[k % COLOR_NAMES.length];
+    }
+    sink.resolved = montages.map(function (m) { return { titulo: m.titulo, score: m.score, pieces: m.pieces.length, cor: m.color_name, text: m.text }; });
+    sink.summary = montages.length + "/" + nVideos + " montagens";
     logObjective(sink);
     return { montages: montages };
   }
@@ -581,18 +656,19 @@ A montagem tem que soar como UMA fala contínua e proposital.
   function removeSilences(transcript, source, opts) {
     opts = opts || {};
     var gap = opts.gap || 0.6;
-    var spans = detectSpokenSpans(transcript, gap);
+    var rawSpans = detectSpokenSpans(transcript, gap);
+    var spans = padSpans(rawSpans, source.duration_sec);
     var cuts = [];
     var kept = 0;
     for (var i = 0; i < spans.length; i++) {
       var s = spans[i];
-      var st = Math.max(0, s.start - 0.03), en = s.end + 0.03;
+      var st = s.start, en = s.end;
       kept += (en - st);
       cuts.push({
         id: "sil_" + i, titulo: "Fala " + (i + 1),
         project_item_id: source.project_item_id,
-        in_ticks: secToTicks(st, source.fps),
-        out_ticks: secToTicks(en, source.fps),
+        in_ticks: secToTicksIn(st, source.fps),
+        out_ticks: secToTicksOut(en, source.fps),
         label_index: 4
       });
     }

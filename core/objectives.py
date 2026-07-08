@@ -155,13 +155,37 @@ def detect_spoken_spans(transcript: TranscriptState, gap_threshold: float = 0.6)
     return spans
 
 
+# Padding ADAPTATIVO (ver core-cep.js, mesma logica). O `end` do Whisper e o fim
+# do fonema, nao da cauda audivel -- medido com ffmpeg silencedetect, o som real
+# continua ate ~160ms depois. Um padding fixo de 0.03s decepava a silaba final.
+HEAD_PAD_MAX = 0.10
+TAIL_PAD_MAX = 0.25
+TAIL_PAD_RATIO = 0.8  # usa ate 80% da folga real -- nunca invade a proxima fala
+
+
+def pad_spans(spans: list[dict], duration_sec: float) -> list[dict]:
+    out = []
+    for i, s in enumerate(spans):
+        prev_end = spans[i - 1]["end"] if i > 0 else 0.0
+        next_start = spans[i + 1]["start"] if i < len(spans) - 1 else (duration_sec or s["end"] + TAIL_PAD_MAX)
+
+        headroom = max(0.0, s["start"] - prev_end)
+        tailroom = max(0.0, next_start - s["end"])
+
+        head = min(HEAD_PAD_MAX, headroom * 0.5)
+        tail = min(TAIL_PAD_MAX, tailroom * TAIL_PAD_RATIO)
+
+        out.append({"start": max(0.0, s["start"] - head), "end": s["end"] + tail})
+    return out
+
+
 def remove_silences(transcript: TranscriptState, duration_sec: float, gap_threshold: float = 0.6) -> dict:
-    spans = detect_spoken_spans(transcript, gap_threshold)
+    raw_spans = detect_spoken_spans(transcript, gap_threshold)
+    spans = pad_spans(raw_spans, duration_sec)
     cuts = []
     kept = 0.0
     for i, s in enumerate(spans):
-        st = max(0.0, s["start"] - 0.03)
-        en = s["end"] + 0.03
+        st, en = s["start"], s["end"]
         kept += en - st
         cuts.append({"id": f"sil_{i}", "start": st, "end": en, "color": "Green"})
     original = duration_sec or (transcript.words[-1].end if transcript.words else kept)

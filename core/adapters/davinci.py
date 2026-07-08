@@ -7,6 +7,7 @@ a partir do FastAPI deve rodar via asyncio.to_thread para nao bloquear o event l
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -350,8 +351,11 @@ def apply_source_cuts(cuts: list[dict], new_timeline_name: str, single_color: st
 
     clip_infos = []
     for c in cuts:
-        sf = round(c["start"] * fps)
-        ef = round(c["end"] * fps)
+        # Arredondamento DIRECIONAL: o corte nunca pode encolher.
+        # round() nos dois lados podia perder ate meio frame em cada ponta,
+        # decepando a silaba final. floor na entrada, ceil na saida.
+        sf = math.floor(c["start"] * fps)
+        ef = math.ceil(c["end"] * fps)
         if ef <= sf:
             continue
         clip_infos.append({"mediaPoolItem": mpi, "startFrame": sf, "endFrame": ef})

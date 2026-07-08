@@ -67,25 +67,38 @@ def _extract_tool_use_input(data: dict) -> dict:
 
 
 def _resolve_and_filter(
-    raw_input: dict, transcript: TranscriptState, min_score: int, max_clips: int
-) -> list[HighlightClip]:
+    raw_input: dict, transcript: TranscriptState, min_score: int, max_clips: int,
+    min_dur: float = 0.0, max_dur: float = 0.0,
+) -> tuple[list[HighlightClip], dict]:
+    """Enforcement de duracao em CODIGO, nao so no prompt -- a IA nao respeita a
+    faixa de forma confiavel, e era isso que gerava 'corte de 15s sem sentido'.
+    Retorna (clips, rejeitados)."""
     try:
         batch = LLMHighlightBatch.model_validate(raw_input)
     except ValidationError as e:
         raise RuntimeError(f"IA devolveu formato invalido: {e}") from e
 
     clips: list[HighlightClip] = []
+    rejected = {"curto": 0, "longo": 0}
     for i, raw in enumerate(batch.clips):
         try:
             clip = resolve_highlight(raw, transcript, clip_id=f"vir_{i:03d}")
         except (KeyError, ValueError):
             # ID de segmento inexistente/invalido — descarta so este corte (secao 16)
             continue
-        if clip.score >= min_score:
-            clips.append(clip)
+        if clip.score < min_score:
+            continue
+        dur = clip.end - clip.start
+        if min_dur and dur < min_dur:
+            rejected["curto"] += 1
+            continue
+        if max_dur and dur > max_dur:
+            rejected["longo"] += 1
+            continue
+        clips.append(clip)
 
     clips.sort(key=lambda c: c.score, reverse=True)
-    return clips[:max_clips]
+    return clips[:max_clips], rejected
 
 
 async def _call_anthropic(
@@ -176,15 +189,16 @@ async def extract_viral_clips(
     transcript: TranscriptState,
     min_score: int = 50,
     max_clips: int = 10,
-    min_dur: float = 20.0,
+    min_dur: float = 30.0,
     max_dur: float = 90.0,
-) -> list[HighlightClip]:
+) -> tuple[list[HighlightClip], dict]:
+    """Retorna (clips, rejeitados). A faixa de duracao e aplicada em codigo."""
     if not transcript.segments:
-        return []
+        return [], {"curto": 0, "longo": 0}
 
     if settings.llm_provider == "openai":
         raw_input = await _call_openai(transcript, min_score, max_clips, min_dur, max_dur)
     else:
         data = await _call_anthropic(transcript, min_score, max_clips, min_dur, max_dur)
         raw_input = _extract_tool_use_input(data)
-    return _resolve_and_filter(raw_input, transcript, min_score, max_clips)
+    return _resolve_and_filter(raw_input, transcript, min_score, max_clips, min_dur, max_dur)

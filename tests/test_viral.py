@@ -69,7 +69,7 @@ def test_resolve_and_filter_derives_real_timecode_not_llm_number():
         ]
     }
 
-    clips = _resolve_and_filter(raw_input, transcript, min_score=50, max_clips=10)
+    clips, _ = _resolve_and_filter(raw_input, transcript, min_score=50, max_clips=10)
 
     assert len(clips) == 1
     assert clips[0].start == pytest.approx(12.00 - 0.08)  # padding default de resolve_highlight
@@ -86,7 +86,7 @@ def test_resolve_and_filter_rejects_score_below_minimum():
         ]
     }
 
-    clips = _resolve_and_filter(raw_input, transcript, min_score=50, max_clips=10)
+    clips, _ = _resolve_and_filter(raw_input, transcript, min_score=50, max_clips=10)
 
     assert len(clips) == 1
     assert clips[0].titulo == "Forte"
@@ -103,7 +103,7 @@ def test_resolve_and_filter_discards_invalid_segment_id_without_crashing():
         ]
     }
 
-    clips = _resolve_and_filter(raw_input, transcript, min_score=50, max_clips=10)
+    clips, _ = _resolve_and_filter(raw_input, transcript, min_score=50, max_clips=10)
 
     assert len(clips) == 1
     assert clips[0].titulo == "Valido"
@@ -119,7 +119,7 @@ def test_resolve_and_filter_respects_max_clips_and_sorts_by_score():
         ]
     }
 
-    clips = _resolve_and_filter(raw_input, transcript, min_score=0, max_clips=2)
+    clips, _ = _resolve_and_filter(raw_input, transcript, min_score=0, max_clips=2)
 
     assert len(clips) == 2
     assert [c.titulo for c in clips] == ["B", "C"]  # ordenado por score desc, top 2

@@ -1,6 +1,7 @@
 """Core Engine — servidor local do VIRALCUT (ver PLANO_MESTRE.md secao 8)."""
 import asyncio
 import json
+import math
 import os
 import tempfile
 import uuid
@@ -267,7 +268,7 @@ async def clips_viral(req: ViralClipsRequest):
         raise HTTPException(status_code=400, detail="Nenhuma transcricao disponivel. Chame /transcribe primeiro.")
 
     try:
-        clips = await extract_viral_clips(
+        clips, rejected = await extract_viral_clips(
             _state["transcript"],
             min_score=req.min_score,
             max_clips=req.max_clips,
@@ -278,7 +279,7 @@ async def clips_viral(req: ViralClipsRequest):
         raise HTTPException(status_code=502, detail=str(e)) from e
 
     _state["clips"] = {c.id: c for c in clips}
-    return {"clips": [c.model_dump() for c in clips]}
+    return {"clips": [c.model_dump() for c in clips], "rejected": rejected}
 
 
 class ApproveRequest(BaseModel):
@@ -405,28 +406,54 @@ def _require_transcript():
     return _dv["transcript"]
 
 
+_DAVINCI_COLORS = ["Blue", "Purple", "Orange", "Green", "Pink", "Teal", "Yellow", "Navy"]
+
+
+class DvViralRequest(BaseModel):
+    min_dur: float = 30.0
+    max_dur: float = 90.0
+    max_clips: int = 12
+    min_score: int = 45
+
+
+class DvMontageRequest(BaseModel):
+    n_videos: int = 3        # quantos videos montados o usuario quer
+    min_dur: float = 30.0
+    max_dur: float = 90.0
+
+
 @app.post("/davinci/viral")
-async def dv_viral():
+async def dv_viral(req: DvViralRequest | None = None):
+    req = req or DvViralRequest()
     transcript = _require_transcript()
-    _DAVINCI_COLORS = ["Blue", "Purple", "Orange", "Green", "Pink", "Teal", "Yellow", "Navy"]
     try:
-        clips = await extract_viral_clips(transcript, min_score=45, max_clips=12, min_dur=15, max_dur=90)
+        clips, rejected = await extract_viral_clips(
+            transcript, min_score=req.min_score, max_clips=req.max_clips,
+            min_dur=req.min_dur, max_dur=req.max_dur,
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     for i, c in enumerate(clips):
         c.color = _DAVINCI_COLORS[i % len(_DAVINCI_COLORS)]
     _dv["viral"] = clips
     _dv_log()
-    return {"clips": [c.model_dump() for c in clips]}
+    return {"clips": [c.model_dump() for c in clips], "rejected": rejected}
 
 
 @app.post("/davinci/frankenbite")
-async def dv_frankenbite():
+async def dv_frankenbite(req: DvMontageRequest | None = None):
+    req = req or DvMontageRequest()
     transcript = _require_transcript()
     try:
-        montages = await extract_montages(transcript, max_montages=3, min_dur=15, max_dur=90)
+        montages = await extract_montages(
+            transcript, max_montages=req.n_videos, min_dur=req.min_dur, max_dur=req.max_dur,
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+    montages = montages[: req.n_videos]
+    # cada montagem inteira ganha 1 cor propria (video montado = 1 cor)
+    for i, m in enumerate(montages):
+        m["color"] = _DAVINCI_COLORS[i % len(_DAVINCI_COLORS)]
     _dv["montages"] = montages
     _dv_log()
     return {"montages": montages}
@@ -466,7 +493,11 @@ async def dv_apply(req: DvApplyRequest):
             created = 0
             for i, m in enumerate(sel):
                 cuts = [{"start": p["start"], "end": p["end"]} for p in m["pieces"]]
-                await asyncio.to_thread(davinci.apply_source_cuts, cuts, f"Montagem {i+1} — {src_name}", "Purple")
+                # cada montagem inteira em UMA cor propria (nao mais "Purple" fixo).
+                # a cor vem da montagem (atribuida em /davinci/frankenbite), para
+                # que preview e timeline batam mesmo com selecao parcial.
+                color = m.get("color") or _DAVINCI_COLORS[i % len(_DAVINCI_COLORS)]
+                await asyncio.to_thread(davinci.apply_source_cuts, cuts, f"Montagem {i+1} — {src_name}", color)
                 created += 1
             result = {"sequences": created}
         elif req.objective == "silences":
@@ -491,7 +522,8 @@ def _dv_apply_colored(cuts: list, colors: list, name: str) -> dict:
     dv._set_output_folder(media_pool, name)  # pasta por timeline
     clip_infos = []
     for c in cuts:
-        sf, ef = round(c["start"] * fps), round(c["end"] * fps)
+        # direcional: floor na entrada, ceil na saida -- corte nunca encolhe
+        sf, ef = math.floor(c["start"] * fps), math.ceil(c["end"] * fps)
         if ef > sf:
             clip_infos.append({"mediaPoolItem": mpi, "startFrame": sf, "endFrame": ef})
     if not clip_infos:

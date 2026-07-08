@@ -37,6 +37,13 @@
   .objs { display:flex; gap:6px; }
   .objs button { flex:1; padding:9px 4px; font-size:12px; line-height:1.2; }
   button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .opts { background:#191c22; border:1px solid var(--line); border-radius:8px; padding:10px; margin-top:8px; }
+  .opt { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:6px 0; }
+  .opt label { font-size:12px; color:var(--dim); }
+  .opt input { width:74px; background:#12151a; border:1px solid var(--line); color:var(--txt);
+               border-radius:6px; padding:5px 7px; font-size:13px; text-align:right; }
+  .opt input:focus { outline:none; border-color:var(--accent); }
+  .swatch { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; vertical-align:middle; }
 </style>
 </head>
 <body>
@@ -69,6 +76,7 @@
       <button class="secondary" id="btnObjFrank">Montar falas</button>
       <button class="secondary" id="btnObjSilence">Remover silêncios</button>
     </div>
+    <div id="opts" class="opts" style="display:none;"></div>
     <div id="results" style="margin-top:8px;"></div>
     <button id="btnApply" style="margin-top:8px; display:none;">Aplicar</button>
     <div id="applyMsg"></div>

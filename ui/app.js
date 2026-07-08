@@ -79,30 +79,78 @@ function selectObj(name) {
   $("btnObj" + ({ viral: "Viral", frankenbite: "Frank", silence: "Silence" })[name]).classList.add("active");
 }
 
-$("btnObjViral").onclick = async () => runObjective("viral");
-$("btnObjFrank").onclick = async () => runObjective("frankenbite");
-$("btnObjSilence").onclick = async () => runObjective("silence");
+// Escolher o objetivo mostra suas OPÇÕES; o usuário ajusta e então executa.
+$("btnObjViral").onclick = () => showOpts("viral");
+$("btnObjFrank").onclick = () => showOpts("frankenbite");
+$("btnObjSilence").onclick = () => showOpts("silence");
+
+const num = (id, fallback) => {
+  const el = $(id);
+  const v = el ? parseFloat(el.value) : NaN;
+  return isNaN(v) ? fallback : v;
+};
+
+function showOpts(name) {
+  if (!transcript) return;
+  selectObj(name);
+  $("results").innerHTML = "";
+  $("btnApply").style.display = "none";
+  $("applyMsg").innerHTML = "";
+
+  const box = $("opts");
+  box.style.display = "block";
+
+  if (name === "viral") {
+    box.innerHTML = `
+      <div class="opt"><label>Duração mínima do corte</label><input id="optMinDur" type="number" min="1" step="5" value="30"> </div>
+      <div class="opt"><label>Duração máxima do corte</label><input id="optMaxDur" type="number" min="2" step="5" value="90"> </div>
+      <div class="dim" style="margin:6px 0 8px;">Cortes fora dessa faixa são descartados — evita trechos curtos sem sentido.</div>
+      <button id="btnRun">Extrair falas virais</button>`;
+  } else if (name === "frankenbite") {
+    box.innerHTML = `
+      <div class="opt"><label>Quantos vídeos montar</label><input id="optNVideos" type="number" min="1" max="8" step="1" value="3"> </div>
+      <div class="opt"><label>Duração mínima de cada</label><input id="optMinDur" type="number" min="1" step="5" value="30"> </div>
+      <div class="opt"><label>Duração máxima de cada</label><input id="optMaxDur" type="number" min="2" step="5" value="90"> </div>
+      <div class="dim" style="margin:6px 0 8px;">Cada vídeo montado vira uma timeline com sua própria cor.</div>
+      <button id="btnRun">Montar falas</button>`;
+  } else {
+    box.innerHTML = `
+      <div class="opt"><label>Cortar pausas a partir de (s)</label><input id="optGap" type="number" min="0.2" step="0.1" value="0.6"> </div>
+      <div class="dim" style="margin:6px 0 8px;">Pausas maiores que isso são removidas. As falas ganham uma folga automática para não cortar a última palavra.</div>
+      <button id="btnRun">Analisar silêncios</button>`;
+  }
+  $("btnRun").onclick = () => runObjective(name);
+}
+
+function readOpts(name) {
+  if (name === "viral") return { minDur: num("optMinDur", 30), maxDur: num("optMaxDur", 90) };
+  if (name === "frankenbite") return { nVideos: num("optNVideos", 3), minDur: num("optMinDur", 30), maxDur: num("optMaxDur", 90) };
+  return { gap: num("optGap", 0.6) };
+}
 
 async function runObjective(name) {
   if (!transcript) return;
-  selectObj(name);
+  const o = readOpts(name);
+  if ((name === "viral" || name === "frankenbite") && o.minDur >= o.maxDur) {
+    return msg($("results"), "A duração mínima precisa ser menor que a máxima.", "err");
+  }
   $("results").innerHTML = `<div class="dim">Processando…</div>`;
   $("btnApply").style.display = "none";
   $("applyMsg").innerHTML = "";
   try {
     if (name === "viral") {
       currentData = IS_PREMIERE
-        ? await core().viralCuts(transcript, window.__source, {})
-        : await api("/davinci/viral", { method: "POST" });
-      renderClips(currentData.clips);
+        ? await core().viralCuts(transcript, window.__source, o)
+        : await api("/davinci/viral", { method: "POST", body: { min_dur: o.minDur, max_dur: o.maxDur } });
+      renderClips(currentData.clips, currentData.rejected, o);
     } else if (name === "frankenbite") {
       currentData = IS_PREMIERE
-        ? await core().frankenbite(transcript, window.__source, {})
-        : await api("/davinci/frankenbite", { method: "POST" });
-      renderMontages(currentData.montages);
+        ? await core().frankenbite(transcript, window.__source, o)
+        : await api("/davinci/frankenbite", { method: "POST", body: { n_videos: o.nVideos, min_dur: o.minDur, max_dur: o.maxDur } });
+      renderMontages(currentData.montages, o);
     } else {
       currentData = IS_PREMIERE
-        ? core().removeSilences(transcript, window.__source, {})
+        ? core().removeSilences(transcript, window.__source, o)
         : { summary: await api("/davinci/silences", { method: "POST" }) };
       renderSilence(currentData.summary);
     }
@@ -110,9 +158,27 @@ async function runObjective(name) {
   } catch (e) { msg($("results"), e.message, "err"); }
 }
 
-function renderClips(clips) {
-  if (!clips.length) return msg($("results"), "Nenhum corte encontrado.", "err");
-  $("results").innerHTML = clips.map((c) => `
+// Cores de preview (mesma ordem do COLOR_CYCLE usado na timeline)
+const SWATCHES = ["#4f8cff", "#a86ff0", "#f08a3c", "#3fb950", "#f06fa8", "#3cc9d6", "#e6c84a", "#3f5ab9"];
+
+function rejectedNote(rejected, o) {
+  if (!rejected) return "";
+  const n = (rejected.curto || 0) + (rejected.longo || 0);
+  if (!n) return "";
+  const partes = [];
+  if (rejected.curto) partes.push(`${rejected.curto} curto(s) demais`);
+  if (rejected.longo) partes.push(`${rejected.longo} longo(s) demais`);
+  return `<div class="dim" style="margin-bottom:6px;">Descartados fora da faixa ${o.minDur}–${o.maxDur}s: ${partes.join(", ")}.</div>`;
+}
+
+function renderClips(clips, rejected, o) {
+  if (!clips.length) {
+    const nota = rejected && (rejected.curto || rejected.longo)
+      ? ` A IA propôs cortes, mas todos ficaram fora da faixa ${o.minDur}–${o.maxDur}s. Tente ampliar a faixa.`
+      : "";
+    return msg($("results"), "Nenhum corte encontrado." + nota, "err");
+  }
+  $("results").innerHTML = rejectedNote(rejected, o) + clips.map((c) => `
     <label class="card"><input type="checkbox" data-id="${c.id}" checked>
       <div><div class="title">${c.titulo}</div>
         <div class="meta">${fmt(c.start)}–${fmt(c.end)} · ${Math.round(c.end - c.start)}s</div>
@@ -121,18 +187,25 @@ function renderClips(clips) {
   $("btnApply").textContent = "Aplicar cortes selecionados";
 }
 
-function renderMontages(montages) {
-  if (!montages.length) return msg($("results"), "Nenhuma montagem gerada.", "err");
-  // Cada montagem marcada = 1 nova timeline. Por padrão marca só a melhor,
-  // para não criar várias timelines sem querer.
-  $("results").innerHTML =
-    `<div class="dim" style="margin-bottom:6px;">Cada montagem marcada vira uma nova timeline. Marque as que quiser.</div>` +
-    montages.map((m, i) => `
+function renderMontages(montages, o) {
+  if (!montages.length) return msg($("results"), "Nenhuma montagem gerada. Tente ampliar a faixa de duração.", "err");
+  const pedido = o && o.nVideos;
+  const aviso = pedido && montages.length < pedido
+    ? `<div class="dim" style="margin-bottom:6px;">Você pediu ${pedido}, mas o vídeo só rendeu ${montages.length} montagem(ns) com material bom.</div>`
+    : "";
+  // Cada montagem marcada = 1 nova timeline, cada uma com sua cor.
+  $("results").innerHTML = aviso +
+    `<div class="dim" style="margin-bottom:6px;">Cada montagem marcada vira uma timeline com sua própria cor.</div>` +
+    montages.map((m, i) => {
+      const cor = SWATCHES[i % SWATCHES.length];
+      const dur = m.pieces.reduce((a, p) => a + (p.end - p.start), 0);
+      return `
     <label class="card"><input type="checkbox" data-id="${m.id}" ${i === 0 ? "checked" : ""}>
-      <div><div class="title">${m.titulo}</div>
-        <div class="meta">${m.pieces.length} trechos costurados</div>
+      <div><div class="title"><span class="swatch" style="background:${cor}"></span>${m.titulo}</div>
+        <div class="meta">${m.pieces.length} trechos · ~${Math.round(dur)}s</div>
         <div class="hook">${m.text}</div></div>
-      <span class="score">${m.score}</span></label>`).join("");
+      <span class="score">${m.score}</span></label>`;
+    }).join("");
   $("btnApply").textContent = "Criar montagens selecionadas";
 }
 
