@@ -16,8 +16,9 @@ DEST="$HOME/viralcut"
 VC_DIR="$HOME/.viralcut"
 
 # Rodando via `curl | bash`, o stdin e o script -- perguntas precisam do terminal.
-TTY=/dev/tty
-[ -r "$TTY" ] || TTY=/dev/null
+# `[ -r /dev/tty ]` nao basta: o arquivo existe mesmo sem terminal anexado e o
+# read falha com "Device not configured". Abrir o fd 3 e o teste que vale.
+if exec 3</dev/tty 2>/dev/null; then HAS_TTY=1; else HAS_TTY=0; fi
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
@@ -35,8 +36,9 @@ if [ -x /opt/homebrew/bin/brew ]; then
 elif [ -x /usr/local/bin/brew ]; then
   eval "$(/usr/local/bin/brew shellenv)"; skip "ja instalado (Intel)"
 else
+  [ "$HAS_TTY" = 1 ] || die "Homebrew precisa de um Terminal interativo. Abra o Terminal e rode o comando de novo."
   echo "  Instalando (pede sua senha do Mac)…"
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < "$TTY"
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" <&3
   [ -x /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)"
   [ -x /usr/local/bin/brew ] && eval "$(/usr/local/bin/brew shellenv)"
   command -v brew >/dev/null || die "Homebrew nao ficou disponivel. Abra um Terminal novo e rode de novo."
@@ -111,8 +113,11 @@ if [ -f "$VC_DIR/.env" ] && grep -q '^OPENAI_API_KEY=sk-' "$VC_DIR/.env" 2>/dev/
 else
   echo "  A chave e usada so para a IA escolher os cortes (texto)."
   echo "  O video e o audio nunca saem do seu computador."
-  printf "  Cole a chave (sk-…) e tecle Enter: "
-  read -r KEY < "$TTY" || KEY=""
+  KEY=""
+  if [ "$HAS_TTY" = 1 ]; then
+    printf "  Cole a chave (sk-…) e tecle Enter: "
+    read -r KEY <&3 || KEY=""
+  fi
   if [ -n "$KEY" ]; then
     printf 'OPENAI_API_KEY=%s\nVIRALCUT_TRANSCRIBE=local\n' "$KEY" > "$VC_DIR/.env"
     chmod 600 "$VC_DIR/.env"

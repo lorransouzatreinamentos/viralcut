@@ -139,12 +139,15 @@ if (-not (Test-Path ".venv")) { & $PyExe @PyArgs -m venv .venv }
 & .\.venv\Scripts\pip.exe install --quiet -r requirements.txt
 Say "  [ok] dependencias instaladas" "Green"
 
+# faster-whisper e OBRIGATORIO: a transcricao roda sempre local, nunca na nuvem.
 Say "  [baixando] transcricao local (faster-whisper -- gratis, offline)..." "Yellow"
 & .\.venv\Scripts\pip.exe install --quiet faster-whisper
 if ($LASTEXITCODE -eq 0) {
     Say "  [ok] transcricao local instalada (o modelo baixa na primeira analise, ~466MB)" "Green"
 } else {
-    Say "  [aviso] nao consegui instalar a transcricao local -- sem problema, o app usa a API da OpenAI." "Yellow"
+    Say "  [ERRO] falha ao instalar faster-whisper. Sem ele o app nao transcreve," "Red"
+    Say "         e nao usamos a nuvem. Rode o instalador de novo." "Red"
+    exit 1
 }
 
 # ---------------------------------------------------------------------

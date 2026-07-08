@@ -49,15 +49,21 @@ Ele vai:
 
 ---
 
-## Instalação no Mac (Adobe Premiere Pro)
+## Instalação no Mac (DaVinci Resolve Studio **e** Adobe Premiere Pro)
 
-Painel CEP self-contained. Ver `scripts/install-premiere.sh` e `PLANO_MESTRE.md`.
+Num Mac zerado, cole no Terminal:
 
 ```bash
-bash scripts/install-premiere.sh   # instala o painel + ativa debug mode
-# preencher a chave em ~/.viralcut/.env
+curl -fsSL https://raw.githubusercontent.com/lorransouzatreinamentos/viralcut/main/install-mac.sh | bash
 ```
-Reiniciar o Premiere → **Window > Extensions > VIRALCUT**.
+
+Instala Homebrew, git, ffmpeg, Python 3.11, o `faster-whisper` e o painel do Premiere (se houver). **Não substitui** git/Python/ffmpeg que já existam na máquina — reaproveita o que está lá. Pede a chave da OpenAI (só para a IA escolher os cortes; o áudio nunca sai do computador).
+
+Depois:
+- **DaVinci** → `Preferences > System > General > External scripting using = Local`, abra a timeline na página Edit e rode `open ~/viralcut/viralcut.command`
+- **Premiere** → reiniciar → **Window > Extensions > VIRALCUT**
+
+Só o painel do Premiere (sem DaVinci): `bash scripts/install-premiere.sh`.
 
 ---
 
@@ -70,8 +76,10 @@ Reiniciar o Premiere → **Window > Extensions > VIRALCUT**.
 | `core/adapters/davinci.py` | Fala com a API do Resolve (source path + criar timelines) |
 | `premiere-panel/` | Painel CEP do Premiere (Node self-contained) |
 | `ui/` | Interface compartilhada (servida pelo Core no DaVinci) |
+| `core/cache.py` | Cache de transcrição por arquivo-fonte (compartilhado com o painel) |
 | `install-windows.ps1` · `viralcut.bat` | Instalador Windows (DaVinci + Premiere) e launcher (DaVinci) |
-| `tests/` | 47 testes unitários + e2e |
+| `install-mac.sh` · `viralcut.command` | Instalador macOS (DaVinci + Premiere) e launcher (DaVinci) |
+| `tests/` | 73 testes unitários + e2e |
 
 ## Log
 
