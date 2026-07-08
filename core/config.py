@@ -16,9 +16,9 @@ class Settings:
     llm_model: str = os.getenv("VIRALCUT_LLM_MODEL", "gpt-4o")
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    # auto = tenta faster-whisper local primeiro (gratis, offline), cai pra API
-    # se nao estiver instalado. "api" forca sempre a nuvem.
-    transcribe_engine: str = os.getenv("VIRALCUT_TRANSCRIBE", "auto")  # auto|api
+    # Transcricao SEMPRE local (faster-whisper): gratis, offline, privada.
+    # "api" e escape hatch manual -- nunca escolhido por fallback automatico.
+    transcribe_engine: str = os.getenv("VIRALCUT_TRANSCRIBE", "local")  # local|api
 
 
 settings = Settings()

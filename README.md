@@ -77,24 +77,24 @@ Reiniciar o Premiere → **Window > Extensions > VIRALCUT**.
 
 Toda análise grava `~/.viralcut/logs/last-run.json` (o que foi enviado à IA, transcrito, retornado e aplicado) — útil para depurar e avaliar a qualidade dos cortes.
 
-## Transcrição: local (grátis) ou nuvem
+## Transcrição: sempre local
 
-Por padrão (`VIRALCUT_TRANSCRIBE=auto`), o app tenta transcrever **localmente** primeiro (via [faster-whisper](https://github.com/SYSTRAN/faster-whisper)) — grátis, offline, sem enviar o vídeo pra internet. Só o **texto** da transcrição (pequeno) vai pra nuvem depois, no passo de extrair os cortes virais (IA).
+A transcrição roda **sempre no seu computador** (via [faster-whisper](https://github.com/SYSTRAN/faster-whisper)) — grátis, offline, o vídeo nunca sai da máquina. Só o **texto** da transcrição (pequeno) vai pra nuvem depois, no passo de extrair os cortes virais (IA).
 
-Se a transcrição local não estiver instalada, cai automaticamente para a API da OpenAI (custo ~$0,006/min) — sem erro, sem configuração.
-
-**Para habilitar o modo local** (opcional, recomendado se o vídeo é longo ou você faz muitas análises):
+Se o `faster-whisper` não estiver instalado, o app **falha com instrução de conserto** — nunca sobe o áudio pra nuvem escondido. Os instaladores (`install-mac.sh`, `install-windows.ps1`) já o instalam. Manualmente:
 ```bash
-# dentro do venv do projeto (o mesmo usado pelo DaVinci)
-.venv/bin/pip install faster-whisper      # Mac/Linux
-.venv\Scripts\pip install faster-whisper  # Windows
-
-# Premiere-only (sem venv do projeto): instala no python do sistema
-pip3 install faster-whisper
+~/viralcut/.venv/bin/pip install faster-whisper       # Mac/Linux
+%USERPROFILE%\viralcut\.venv\Scripts\pip install faster-whisper  # Windows
 ```
-Primeira transcrição local baixa o modelo (`small`, ~466MB, uma vez só, fica em cache do HuggingFace). Depois disso, roda ~7× mais rápido que tempo real em CPU comum, sem GPU.
+Primeira transcrição baixa o modelo (`small`, ~466MB, uma vez só, fica em cache do HuggingFace). Depois roda ~7× mais rápido que tempo real em CPU comum, sem GPU.
 
-Forçar sempre a nuvem: `VIRALCUT_TRANSCRIBE=api` no `.env`.
+### Cache
+
+Cada transcrição é guardada em `~/.viralcut/cache/`, chaveada pelo **arquivo de vídeo** (caminho + tamanho + data de modificação). Abrir o mesmo vídeo de novo reaproveita a transcrição na hora — inclusive entre Premiere e DaVinci, que compartilham o mesmo cache.
+
+Mexer na timeline (cortar, reordenar) **não** invalida o cache: o que é transcrito é o arquivo-fonte, e ele não mudou. Trocar o vídeo invalida sozinho. Para forçar do zero, use **↻ Transcrever novamente** no painel.
+
+Escape hatch (usa a API da OpenAI, custa ~$0,006/min e sobe o áudio): `VIRALCUT_TRANSCRIBE=api` no `.env`.
 
 ## Requisitos por plataforma
 

@@ -8,7 +8,8 @@ Arquivo unico usado pelos dois hosts:
     (nao precisa de passo extra no install-premiere.sh / install-windows.ps1).
 
 Se faster-whisper nao estiver instalado, imprime {"error": "..."} e sai com
-codigo 1 -- o chamador (Python ou Node) cai de volta pra API da OpenAI.
+codigo 1 -- o chamador (Python ou Node) mostra a instrucao de instalacao. NAO ha
+fallback pra nuvem: a transcricao roda sempre aqui, no computador do usuario.
 
 Uso: python local_transcribe.py <audio> [idioma] [modelo]
 Saida (stdout): JSON {"words": [...], "segments": [...]}  -- mesmo schema
@@ -60,7 +61,7 @@ def main():
             })
 
         print(json.dumps({"words": words, "segments": segments}))
-    except Exception as e:  # noqa: BLE001 -- qualquer falha aqui = fallback pra API
+    except Exception as e:  # noqa: BLE001 -- erro estruturado p/ o chamador exibir
         print(json.dumps({"error": str(e)}))
         sys.exit(1)
 

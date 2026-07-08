@@ -54,30 +54,41 @@ $("btnSelect").onclick = async () => {
   } catch (e) { msg($("tlInfo"), e.message, "err"); }
 };
 
-// --- Passo 2: transcrever (uma vez) ---
-$("btnAnalyze").onclick = async () => {
+// --- Passo 2: transcrever (uma vez; reusa cache do mesmo vídeo) ---
+// force=true: o usuário trocou/reeditou a mídia e quer refazer do zero.
+async function runTranscribe(force) {
   $("btnAnalyze").disabled = true;
+  $("btnRetranscribe").disabled = true;
   $("progressWrap").style.display = "block";
   try {
-    let words;
+    let words, cached;
     if (IS_PREMIERE) {
-      transcript = await core().transcribe(window.__source, (p, t) => setP(p, t));
+      transcript = await core().transcribe(window.__source, (p, t) => setP(p, t), force);
       words = transcript.words.length;
+      cached = transcript.__cached;
     } else {
-      setP(30, "Transcrevendo (pode levar 1-2 min)…");
-      const r = await api("/davinci/transcribe", { method: "POST" });
+      setP(30, force ? "Transcrevendo de novo…" : "Transcrevendo (pode levar 1-2 min)…");
+      const r = await api("/davinci/transcribe", { method: "POST", body: { force: !!force } });
       transcript = true; // no DaVinci a transcrição fica no Core; a UI só precisa saber que existe
       words = r.words;
+      cached = r.cached;
       setP(100, `${words} palavras`);
     }
     $("objStep").style.display = "block";
-    $("analyzeDone").textContent = `✓ ${words} palavras transcritas — escolha um objetivo (pode repetir).`;
+    $("analyzeDone").textContent = cached
+      ? `✓ ${words} palavras (reaproveitadas do cache deste vídeo) — escolha um objetivo.`
+      : `✓ ${words} palavras transcritas — escolha um objetivo (pode repetir).`;
+    $("btnRetranscribe").style.display = "inline-block";
   } catch (e) {
     setP(0, "");
     msg($("progressTxt"), e.message, "err");
     $("btnAnalyze").disabled = false;
   }
-};
+  $("btnRetranscribe").disabled = false;
+}
+
+$("btnAnalyze").onclick = () => runTranscribe(false);
+$("btnRetranscribe").onclick = () => runTranscribe(true);
 
 // --- Passo 3: objetivos ---
 function selectObj(name) {

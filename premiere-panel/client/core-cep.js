@@ -18,9 +18,9 @@
   var path = require("path");
   var os = require("os");
   var childProcess = require("child_process");
+  var crypto = require("crypto");
 
-  var WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions";
-  var CHAT_URL = "https://api.openai.com/v1/chat/completions";
+  var CHAT_URL ="https://api.openai.com/v1/chat/completions";
   var CHAT_MODEL = "gpt-4o";
   var TICKS_PER_SEC = 254016000000;
 
@@ -35,11 +35,6 @@
     path.join(HOME, ".viralcut.env"),
     "/Applications/CLAUDE CODE/Projetos/VIRALCUT/.env" // legado (Mac do dono)
   ];
-  var FFMPEG_CANDIDATES = [
-    "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg",
-    "C:\\ffmpeg\\bin\\ffmpeg.exe", "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe"
-  ];
-
   // Script compartilhado com o Core Python (mesma implementacao da engine local,
   // ver o proprio arquivo). Fica em premiere-panel/host/ -- co-localizado com
   // este arquivo (client/), sobrevive ao install (pasta inteira e copiada).
@@ -114,54 +109,61 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
     throw new Error("OPENAI_API_KEY não configurada. Rode o instalador ou crie " + ENV_CANDIDATES[0]);
   }
 
-  function findFfmpeg() {
-    for (var i = 0; i < FFMPEG_CANDIDATES.length; i++) {
-      try { if (fs.existsSync(FFMPEG_CANDIDATES[i])) return FFMPEG_CANDIDATES[i]; } catch (e) {}
-    }
-    // fallback: 'ffmpeg' no PATH
-    return "ffmpeg";
+  // ---------------------------------------------------------------------------
+  // Cache de transcricao. Mesma chave e mesmo diretorio do core/cache.py, entao
+  // Premiere e DaVinci reaproveitam a transcricao um do outro para o mesmo video.
+  // Chave = versao|caminho absoluto|tamanho|mtime(seg)|idioma.
+  // ---------------------------------------------------------------------------
+  var CACHE_DIR = path.join(HOME, ".viralcut", "cache");
+  var CACHE_VERSION = 1;
+
+  function cacheFingerprint(mediaPath, language) {
+    var st;
+    try { st = fs.statSync(mediaPath); } catch (e) { return null; }
+    var raw = CACHE_VERSION + "|" + path.resolve(mediaPath) + "|" + st.size +
+              "|" + Math.floor(st.mtimeMs / 1000) + "|" + language;
+    return crypto.createHash("sha1").update(raw, "utf8").digest("hex");
   }
 
-  function tmpFile(ext) {
-    return path.join(os.tmpdir(), "viralcut_" + Date.now() + "_" + Math.floor(Math.random() * 1e6) + ext);
+  function cacheLoad(mediaPath, language) {
+    var fp = cacheFingerprint(mediaPath, language);
+    if (!fp) return null;
+    var file = path.join(CACHE_DIR, fp + ".json");
+    if (!fs.existsSync(file)) return null;
+    try {
+      var data = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (!data.segments || !data.segments.length) return null;
+      return data;
+    } catch (e) { return null; }
+  }
+
+  function cacheSave(mediaPath, language, transcript, engine) {
+    var fp = cacheFingerprint(mediaPath, language);
+    if (!fp) return;
+    try {
+      fs.mkdirSync(CACHE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(CACHE_DIR, fp + ".json"), JSON.stringify({
+        version: CACHE_VERSION,
+        media_path: path.resolve(mediaPath),
+        language: language,
+        engine: engine,
+        created_at: new Date().toISOString().slice(0, 19).replace("T", " "),
+        words: transcript.words,
+        segments: transcript.segments
+      }), "utf8");
+    } catch (e) {} // cache e otimizacao: falhar aqui nunca derruba o fluxo
   }
 
   // ---------------------------------------------------------------------------
-  // Extracao de audio (ffmpeg -> mp3 16kHz mono, leve p/ Whisper)
+  // Transcricao LOCAL (faster-whisper via python). SEMPRE local: gratis, offline,
+  // privada. Se nao estiver instalada, o app FALHA com instrucao -- nunca manda
+  // audio pra nuvem escondido (custo e privacidade do usuario).
   // ---------------------------------------------------------------------------
-  function extractAudio(videoPath) {
-    return new Promise(function (resolve, reject) {
-      var out = tmpFile(".mp3");
-      var ff = findFfmpeg();
-      childProcess.execFile(
-        ff,
-        ["-y", "-i", videoPath, "-vn", "-ar", "16000", "-ac", "1", "-b:a", "64k", out],
-        { timeout: 600000 },
-        function (err, stdout, stderr) {
-          if (err) return reject(new Error("ffmpeg falhou: " + (stderr || err.message).slice(-400)));
-          if (!fs.existsSync(out)) return reject(new Error("ffmpeg nao gerou audio"));
-          resolve(out);
-        }
-      );
-    });
-  }
-
-  // ---------------------------------------------------------------------------
-  // Transcricao (Whisper, word-level)
-  // ---------------------------------------------------------------------------
-  function contentTypeFor(p) {
-    var e = p.toLowerCase();
-    if (e.indexOf(".mp3") >= 0) return "audio/mpeg";
-    if (e.indexOf(".wav") >= 0) return "audio/wav";
-    if (e.indexOf(".m4a") >= 0) return "audio/mp4";
-    return "application/octet-stream";
-  }
-
-  // ---------------------------------------------------------------------------
-  // Transcricao LOCAL (opcional): tenta faster-whisper via python antes da nuvem.
-  // Gratis, offline. So funciona se o usuario tiver instalado (pip install
-  // faster-whisper) -- se nao tiver, retorna null e o chamador cai pra API.
-  // ---------------------------------------------------------------------------
+  var INSTALL_HINT =
+    "Transcrição local indisponível. Ela roda sempre no seu computador " +
+    "(nunca na nuvem). Para instalar, rode no Terminal:\n\n" +
+    "  ~/viralcut/.venv/bin/pip install faster-whisper\n\n" +
+    "Ou rode o instalador de novo (install-mac.sh / install-windows.ps1).";
   function pythonCandidates() {
     // ponytail: assume o venv no local padrao do instalador (~/viralcut/.venv).
     // Se o repo foi clonado em outro lugar, cai pros comandos genericos abaixo.
@@ -181,7 +183,9 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   }
 
   async function transcribeLocal(audioPath, language) {
-    if (!fs.existsSync(LOCAL_TRANSCRIBE_SCRIPT)) return null;
+    if (!fs.existsSync(LOCAL_TRANSCRIBE_SCRIPT)) {
+      throw new Error(INSTALL_HINT + "\n\n(script não encontrado: " + LOCAL_TRANSCRIBE_SCRIPT + ")");
+    }
     var candidates = pythonCandidates();
     for (var i = 0; i < candidates.length; i++) {
       var exe = candidates[i];
@@ -196,66 +200,7 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
       if (!segments.length) continue;
       return { words: words, segments: segments };
     }
-    return null;
-  }
-
-  async function whisperTranscribe(mp3Path, apiKey) {
-    var st = fs.statSync(mp3Path);
-    if (st.size > 24 * 1024 * 1024) {
-      throw new Error("Vídeo longo demais para transcrição direta (~50min+). Divida em partes menores.");
-    }
-    var buffer = fs.readFileSync(mp3Path);
-    var u8 = new Uint8Array(buffer.byteLength);
-    u8.set(buffer);
-    var blob = new Blob([u8], { type: contentTypeFor(mp3Path) });
-
-    var form = new FormData();
-    form.append("file", blob, path.basename(mp3Path));
-    form.append("model", "whisper-1");
-    form.append("response_format", "verbose_json");
-    form.append("language", "pt");
-    form.append("timestamp_granularities[]", "segment");
-    form.append("timestamp_granularities[]", "word");
-
-    var res = await fetch(WHISPER_URL, {
-      method: "POST",
-      headers: { Authorization: "Bearer " + apiKey },
-      body: form
-    });
-    if (!res.ok) {
-      var detail = "HTTP " + res.status;
-      try { var j = await res.json(); if (j.error && j.error.message) detail = j.error.message; } catch (e) {}
-      throw new Error("Whisper falhou: " + detail);
-    }
-    var json = await res.json();
-    return buildTranscript(json);
-  }
-
-  // Monta words[] + segments[] com word_ids (a fonte de verdade de tempo).
-  function buildTranscript(json) {
-    var rawWords = Array.isArray(json.words) ? json.words : [];
-    var words = [];
-    for (var i = 0; i < rawWords.length; i++) {
-      var w = rawWords[i];
-      var start = typeof w.start === "number" ? w.start : 0;
-      var end = typeof w.end === "number" ? w.end : 0;
-      if (end <= start) continue;
-      words.push({ id: words.length, text: String(w.word || "").trim(), start: start, end: end });
-    }
-    var rawSegs = Array.isArray(json.segments) ? json.segments : [];
-    var segments = [];
-    for (var s = 0; s < rawSegs.length; s++) {
-      var seg = rawSegs[s];
-      var ss = typeof seg.start === "number" ? seg.start : 0;
-      var se = typeof seg.end === "number" ? seg.end : 0;
-      if (se <= ss) continue;
-      var wids = [];
-      for (var k = 0; k < words.length; k++) {
-        if (words[k].start >= ss - 0.001 && words[k].end <= se + 0.001) wids.push(words[k].id);
-      }
-      segments.push({ id: segments.length, start: ss, end: se, text: (seg.text || "").trim(), word_ids: wids });
-    }
-    return { words: words, segments: segments };
+    throw new Error(INSTALL_HINT);
   }
 
   // ---------------------------------------------------------------------------
@@ -568,32 +513,42 @@ A montagem tem que soar como UMA fala contínua e proposital.
   // ===========================================================================
   // ORQUESTRACAO PUBLICA
   // ===========================================================================
-  async function transcribe(source, onProgress) {
+  /** force=true: usuario clicou "Transcrever novamente" (mudou a mídia). */
+  async function transcribe(source, onProgress, force) {
     onProgress = onProgress || function () {};
     logReset(source);
 
-    onProgress(15, "Tentando transcrição local (grátis)…");
-    var transcript = await transcribeLocal(source.path, "pt");
-    var usedLocal = !!transcript;
+    var engine = "local (faster-whisper)";
+    var cached = false;
+    var transcript = null;
+
+    if (!force) {
+      var hit = cacheLoad(source.path, "pt");
+      if (hit) {
+        transcript = { words: hit.words, segments: hit.segments };
+        engine = hit.engine || "?";
+        cached = true;
+        onProgress(90, "Transcrição em cache (" + (hit.created_at || "") + ")");
+      }
+    }
 
     if (!transcript) {
-      var apiKey = readOpenAIKey();
-      onProgress(20, "Extraindo áudio…");
-      var mp3 = await extractAudio(source.path);
-      onProgress(55, "Transcrevendo (Whisper API)…");
-      transcript = await whisperTranscribe(mp3, apiKey);
-      try { fs.unlinkSync(mp3); } catch (e) {}
+      onProgress(15, "Transcrevendo no seu computador…");
+      transcript = await transcribeLocal(source.path, "pt");
+      cacheSave(source.path, "pt", transcript, engine);
     }
 
     if (!transcript.segments.length) throw new Error("Nenhuma fala detectada no vídeo.");
 
     logSet("whisper", {
-      engine: usedLocal ? "local (faster-whisper)" : "api (OpenAI)",
+      engine: engine,
+      cached: cached,
       words: transcript.words.length,
       segments: transcript.segments.length,
       full_text: transcript.segments.map(function (s) { return s.text; }).join(" ")
     });
-    onProgress(100, transcript.words.length + " palavras (" + (usedLocal ? "local" : "nuvem") + ")");
+    onProgress(100, transcript.words.length + " palavras (" + (cached ? "cache" : "local") + ")");
+    transcript.__cached = cached;
     return transcript;
   }
 
@@ -713,7 +668,7 @@ A montagem tem que soar como UMA fala contínua e proposital.
     logApplied: logApplied,
     updatePanel: updatePanel,
     // expostos para teste
-    _buildTranscript: buildTranscript,
+    _cacheFingerprint: cacheFingerprint,
     _resolveClips: resolveClips,
     _secToTicks: secToTicks,
     _detectSpokenSpans: detectSpokenSpans,

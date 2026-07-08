@@ -1,15 +1,16 @@
 """
 Transcricao word-level (ver PLANO_MESTRE.md secoes 6, 9.1, 16).
 
-Duas engines, tentadas nesta ordem (transparente pro resto do app):
-  1. LOCAL (faster-whisper, via local_transcribe.py) -- gratis, offline, privado.
-     So roda se o pacote estiver instalado (`pip install faster-whisper`); opcional,
-     nao e dependencia obrigatoria. Se nao estiver, cai pra API sem erro visivel.
-  2. API (OpenAI Whisper na nuvem) -- sempre funciona se houver OPENAI_API_KEY.
+A transcricao roda SEMPRE LOCAL (faster-whisper, via local_transcribe.py):
+gratis, offline, privado. Se o pacote nao estiver instalado, o app FALHA com
+instrucao de conserto -- nunca cai escondido pra nuvem (custo e privacidade).
 
+A nuvem (OpenAI Whisper) so entra com VIRALCUT_TRANSCRIBE=api explicito no .env.
 Fluxo cloud: audio bruto -> comprime p/ MP3 16kHz mono (cabe no limite de 25MB
 do Whisper p/ a maioria dos videos) -> se ainda exceder, divide em pedacos ->
 transcreve cada pedaco -> soma o offset de tempo -> junta tudo num TranscriptState.
+
+O resultado vai pro cache (core/cache.py), chaveado pelo arquivo-fonte.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from pathlib import Path
 
 import httpx
 
+from core import cache
 from core.config import settings
 from core.model import Segment, TranscriptState, Word
 
@@ -156,12 +158,20 @@ def merge_transcript_states(chunks: list[TranscriptState]) -> TranscriptState:
     return TranscriptState(words=all_words, segments=all_segments)
 
 
-def _try_local_transcribe_sync(audio_path: str, language: str) -> TranscriptState | None:
-    """Tenta a engine local (faster-whisper). Retorna None em QUALQUER falha
-    (script ausente, pacote nao instalado, erro de inferencia) -- o chamador
-    cai para a API sem quebrar a analise. Nunca levanta excecao."""
+INSTALL_HINT = (
+    "Transcricao local indisponivel: {motivo}.\n"
+    "A transcricao SEMPRE roda local (nunca na nuvem). Para instalar:\n"
+    "  pip install faster-whisper\n"
+    "Ou rode o instalador novamente (install-mac.sh / install-windows.ps1)."
+)
+
+
+def _local_transcribe_sync(audio_path: str, language: str) -> TranscriptState:
+    """Engine local (faster-whisper). Levanta RuntimeError com instrucao de
+    conserto -- nao existe mais fallback silencioso pra nuvem (o usuario nao
+    quer pagar API nem mandar audio pra fora sem saber)."""
     if not _LOCAL_SCRIPT.exists():
-        return None
+        raise RuntimeError(INSTALL_HINT.format(motivo=f"script nao encontrado em {_LOCAL_SCRIPT}"))
     try:
         # sys.executable (nao "python3" fixo) -- garante o MESMO interprete que
         # esta rodando este processo (o venv onde faster-whisper foi instalado).
@@ -170,33 +180,27 @@ def _try_local_transcribe_sync(audio_path: str, language: str) -> TranscriptStat
             [sys.executable, str(_LOCAL_SCRIPT), audio_path, language],
             capture_output=True, text=True, timeout=1800,
         )
-    except Exception:  # noqa: BLE001 -- python3 ausente, timeout, etc: fallback silencioso
-        return None
+    except Exception as e:  # noqa: BLE001 -- timeout, interpretador quebrado
+        raise RuntimeError(INSTALL_HINT.format(motivo=str(e))) from e
+
     if result.returncode != 0:
-        return None
+        raise RuntimeError(INSTALL_HINT.format(motivo=(result.stderr or "").strip()[:400] or "falha na engine"))
     try:
         data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as e:
+        raise RuntimeError(INSTALL_HINT.format(motivo="saida invalida da engine local")) from e
     if "error" in data:
-        return None
-    try:
-        words = [Word(**w) for w in data.get("words", [])]
-        segments = [Segment(**s) for s in data.get("segments", [])]
-        return TranscriptState(words=words, segments=segments)
-    except Exception:  # noqa: BLE001 -- schema inesperado: fallback
-        return None
+        raise RuntimeError(INSTALL_HINT.format(motivo=str(data["error"])[:400]))
+
+    words = [Word(**w) for w in data.get("words", [])]
+    segments = [Segment(**s) for s in data.get("segments", [])]
+    if not segments:
+        raise RuntimeError("A transcricao local nao encontrou fala nenhuma neste video.")
+    return TranscriptState(words=words, segments=segments)
 
 
-async def transcribe_timeline_audio(raw_audio_path: str, output_dir: str, language: str = "pt") -> TranscriptState:
-    """Orquestra a transcricao: tenta local primeiro (gratis, offline), cai pra
-    API se indisponivel. Fluxo da API: comprime -> divide se preciso -> transcreve
-    -> junta. VIRALCUT_TRANSCRIBE=api no .env forca sempre a nuvem."""
-    if settings.transcribe_engine != "api":
-        local = await asyncio.to_thread(_try_local_transcribe_sync, raw_audio_path, language)
-        if local is not None and local.segments:
-            return local
-
+async def _transcribe_via_api(raw_audio_path: str, output_dir: str, language: str) -> TranscriptState:
+    """So roda com VIRALCUT_TRANSCRIBE=api explicito no .env. Nunca por fallback."""
     compressed = compress_audio_for_whisper(raw_audio_path, output_dir)
     chunks = split_audio_if_needed(compressed, output_dir)
 
@@ -207,3 +211,49 @@ async def transcribe_timeline_audio(raw_audio_path: str, output_dir: str, langua
         results.append(TranscriptState(words=words, segments=segments))
 
     return results[0] if len(results) == 1 else merge_transcript_states(results)
+
+
+async def transcribe_timeline_audio(
+    raw_audio_path: str,
+    output_dir: str,
+    language: str = "pt",
+    force: bool = False,
+    cache_key_path: str | None = None,
+) -> tuple[TranscriptState, dict]:
+    """Transcreve SEMPRE local. Reusa o cache quando o arquivo-fonte e o mesmo.
+
+    force=True ignora o cache (o usuario editou/trocou a midia e quer refazer).
+    cache_key_path: arquivo cuja identidade define o cache -- normalmente o video
+    de origem, mesmo quando `raw_audio_path` e um wav temporario extraido dele.
+
+    Retorna (transcript, meta) onde meta = {"cached": bool, "engine": str,
+    "created_at": str|None} para a UI mostrar de onde veio.
+    """
+    key = cache_key_path or raw_audio_path
+
+    if not force:
+        hit = cache.load(key, language)
+        if hit:
+            return (
+                TranscriptState(
+                    words=[Word(**w) for w in hit["words"]],
+                    segments=[Segment(**s) for s in hit["segments"]],
+                ),
+                {"cached": True, "engine": hit.get("engine", "?"), "created_at": hit.get("created_at")},
+            )
+
+    if settings.transcribe_engine == "api":
+        state = await _transcribe_via_api(raw_audio_path, output_dir, language)
+        engine = "api (OpenAI)"
+    else:
+        state = await asyncio.to_thread(_local_transcribe_sync, raw_audio_path, language)
+        engine = "local (faster-whisper)"
+
+    cache.save(
+        key,
+        [w.model_dump() for w in state.words],
+        [s.model_dump() for s in state.segments],
+        engine,
+        language,
+    )
+    return state, {"cached": False, "engine": engine, "created_at": None}

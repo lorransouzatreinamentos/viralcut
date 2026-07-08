@@ -121,7 +121,7 @@ if (typeof JSON !== 'object') JSON = {};
         };
     }
 }());
-var VIRALCUT_BUILD = "V.08.07.26.15.54";
+var VIRALCUT_BUILD = "V.08.07.26.16.18";
 /**
  * VIRALCUT — ExtendScript host (Premiere Pro).
  *

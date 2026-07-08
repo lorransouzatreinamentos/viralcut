@@ -1,1 +1,1 @@
-window.__VIRALCUT_VERSION = "V.08.07.26.15.54";
+window.__VIRALCUT_VERSION = "V.08.07.26.16.18";

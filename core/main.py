@@ -194,7 +194,9 @@ async def _run_transcription(job_id: str, language: str):
             davinci.export_timeline_audio, str(TMP_DIR), f"seq_{job_id}"
         )
         _jobs[job_id]["progress"] = 50
-        transcript = await transcribe_timeline_audio(audio_path, str(TMP_DIR), language=language)
+        # audio exportado e um wav novo a cada job -> cache nunca acerta aqui (ok:
+        # este endpoint legado nao e o caminho usado pela UI).
+        transcript, _meta = await transcribe_timeline_audio(audio_path, str(TMP_DIR), language=language)
         _state["transcript"] = transcript
         _jobs[job_id] = {
             "status": "done",
@@ -215,6 +217,7 @@ class TranscribeFileRequest(BaseModel):
     project_item_id: str
     duration_sec: float = 0.0
     language: str = "pt"
+    force: bool = False  # ignora o cache (usuario trocou/editou a midia)
 
 
 @app.post("/transcribe/file")
@@ -229,20 +232,21 @@ async def transcribe_file_start(req: TranscribeFileRequest):
     }
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {"status": "running", "progress": 0}
-    asyncio.create_task(_run_file_transcription(job_id, req.path, req.language))
+    asyncio.create_task(_run_file_transcription(job_id, req.path, req.language, req.force))
     return {"job_id": job_id}
 
 
-async def _run_file_transcription(job_id: str, path: str, language: str):
+async def _run_file_transcription(job_id: str, path: str, language: str, force: bool = False):
     try:
         _jobs[job_id]["progress"] = 30
-        transcript = await transcribe_timeline_audio(path, str(TMP_DIR), language=language)
+        transcript, meta = await transcribe_timeline_audio(path, str(TMP_DIR), language=language, force=force)
         _state["transcript"] = transcript
         _jobs[job_id] = {
             "status": "done",
             "progress": 100,
             "words": len(transcript.words),
             "segments": len(transcript.segments),
+            **meta,
         }
     except Exception as e:  # noqa: BLE001
         _jobs[job_id] = {"status": "error", "progress": 0, "error": str(e)}
@@ -397,22 +401,28 @@ async def dv_select():
     return info
 
 
+class DvTranscribeRequest(BaseModel):
+    force: bool = False  # "Transcrever novamente": ignora o cache
+
+
 @app.post("/davinci/transcribe")
-async def dv_transcribe():
+async def dv_transcribe(req: DvTranscribeRequest | None = None):
     if _dv["source"] is None:
         raise HTTPException(status_code=400, detail="Selecione a timeline primeiro.")
     path = _dv["source"]["path"]
     if not os.path.exists(path):
         raise HTTPException(status_code=400, detail=f"Arquivo de origem nao encontrado: {path}")
+    force = bool(req and req.force)
     try:
-        transcript = await transcribe_timeline_audio(path, str(TMP_DIR), language="pt")
+        transcript, meta = await transcribe_timeline_audio(path, str(TMP_DIR), language="pt", force=force)
     except Exception as e:  # noqa: BLE001
+        _dv_log_error("transcribe", str(e))
         raise HTTPException(status_code=502, detail=f"Falha na transcricao: {e}") from e
     if not transcript.segments:
         raise HTTPException(status_code=400, detail="Nenhuma fala detectada no video.")
     _dv["transcript"] = transcript
     _dv_log()
-    return {"words": len(transcript.words), "segments": len(transcript.segments)}
+    return {"words": len(transcript.words), "segments": len(transcript.segments), **meta}
 
 
 def _require_transcript():
