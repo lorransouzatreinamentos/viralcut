@@ -1,5 +1,6 @@
 """Core Engine — servidor local do VIRALCUT (ver PLANO_MESTRE.md secao 8)."""
 import asyncio
+import json
 import os
 import tempfile
 import uuid
@@ -12,6 +13,7 @@ from pydantic import BaseModel
 from core.adapters import davinci
 from core.adapters.premiere_plan import SeqItemDesc, build_cut_plan
 from core.config import settings
+from core.objectives import extract_montages, remove_silences
 from core.transcribe import transcribe_timeline_audio
 from core.viral import extract_viral_clips
 
@@ -29,10 +31,74 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 _jobs: dict[str, dict] = {}
 _state: dict = {"timeline": None, "transcript": None, "clips": {}, "premiere_source": None}
 
+# Estado + log do fluxo DaVinci (browser UI -> Core Python -> Resolve)
+_dv: dict = {"source": None, "transcript": None, "viral": [], "montages": [], "silences": None}
+_LOG_DIR = Path.home() / ".viralcut" / "logs"
+
+
+def _dv_log():
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        snapshot = {
+            "host": "davinci",
+            "source": _dv["source"],
+            "whisper": (
+                {"words": len(_dv["transcript"].words), "segments": len(_dv["transcript"].segments),
+                 "full_text": " ".join(s.text for s in _dv["transcript"].segments)}
+                if _dv["transcript"] else None
+            ),
+            "viral": [{"titulo": c.titulo, "score": c.score, "start": c.start, "end": c.end, "text": c.text}
+                      for c in _dv["viral"]],
+            "montages": [{"titulo": m["titulo"], "score": m["score"], "pieces": len(m["pieces"]), "text": m["text"]}
+                         for m in _dv["montages"]],
+            "silences": _dv["silences"],
+        }
+        (_LOG_DIR / "last-run.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), "utf8")
+    except Exception:  # noqa: BLE001 — log nunca derruba a operacao
+        pass
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _git_version() -> str:
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "log", "-1", "--format=V.%cd", "--date=format:%d.%m.%y.%H.%M"],
+            capture_output=True, text=True, cwd=str(_REPO_ROOT), timeout=10,
+        )
+        v = out.stdout.strip()
+        return v or "dev"
+    except Exception:  # noqa: BLE001
+        return "dev"
+
 
 @app.get("/health")
 def health():
     return {"status": "ok", "version": app.version}
+
+
+@app.get("/version")
+def version():
+    return {"version": _git_version()}
+
+
+@app.post("/update")
+def update():
+    """Auto-update do app DaVinci: git pull. Com uvicorn --reload, o servidor
+    recarrega o código sozinho; o browser dá reload e pega a versão nova."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "pull", "--ff-only"], capture_output=True, text=True,
+            cwd=str(_REPO_ROOT), timeout=60,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"git pull falhou: {e}") from e
+    if out.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"git pull falhou: {out.stderr[-300:]}")
+    return {"ok": True, "output": out.stdout.strip(), "version": _git_version()}
 
 
 @app.get("/host")
@@ -296,3 +362,145 @@ async def apply(req: ApplyRequest):
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return result
+
+
+# ===========================================================================
+# FLUXO DAVINCI — browser UI -> Core Python -> Resolve (Studio)
+# Transcreve o arquivo-fonte 1x; aplica objetivos quantas vezes quiser.
+# ===========================================================================
+
+
+@app.post("/davinci/select")
+async def dv_select():
+    try:
+        info = await asyncio.to_thread(davinci.get_source_media_path)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    _dv.update({"source": info, "transcript": None, "viral": [], "montages": [], "silences": None})
+    _dv_log()
+    return info
+
+
+@app.post("/davinci/transcribe")
+async def dv_transcribe():
+    if _dv["source"] is None:
+        raise HTTPException(status_code=400, detail="Selecione a timeline primeiro.")
+    path = _dv["source"]["path"]
+    if not os.path.exists(path):
+        raise HTTPException(status_code=400, detail=f"Arquivo de origem nao encontrado: {path}")
+    try:
+        transcript = await transcribe_timeline_audio(path, str(TMP_DIR), language="pt")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Falha na transcricao: {e}") from e
+    if not transcript.segments:
+        raise HTTPException(status_code=400, detail="Nenhuma fala detectada no video.")
+    _dv["transcript"] = transcript
+    _dv_log()
+    return {"words": len(transcript.words), "segments": len(transcript.segments)}
+
+
+def _require_transcript():
+    if _dv["transcript"] is None:
+        raise HTTPException(status_code=400, detail="Transcreva primeiro.")
+    return _dv["transcript"]
+
+
+@app.post("/davinci/viral")
+async def dv_viral():
+    transcript = _require_transcript()
+    _DAVINCI_COLORS = ["Blue", "Purple", "Orange", "Green", "Pink", "Teal", "Yellow", "Navy"]
+    try:
+        clips = await extract_viral_clips(transcript, min_score=45, max_clips=12, min_dur=15, max_dur=90)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    for i, c in enumerate(clips):
+        c.color = _DAVINCI_COLORS[i % len(_DAVINCI_COLORS)]
+    _dv["viral"] = clips
+    _dv_log()
+    return {"clips": [c.model_dump() for c in clips]}
+
+
+@app.post("/davinci/frankenbite")
+async def dv_frankenbite():
+    transcript = _require_transcript()
+    try:
+        montages = await extract_montages(transcript, max_montages=3, min_dur=15, max_dur=90)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    _dv["montages"] = montages
+    _dv_log()
+    return {"montages": montages}
+
+
+@app.post("/davinci/silences")
+async def dv_silences():
+    transcript = _require_transcript()
+    dur = _dv["source"]["duration_sec"] if _dv["source"] else 0.0
+    result = remove_silences(transcript, duration_sec=dur)
+    _dv["silences"] = {k: v for k, v in result.items() if k != "cuts"}
+    _dv_log()
+    return result
+
+
+class DvApplyRequest(BaseModel):
+    objective: str            # "viral" | "frankenbite" | "silences"
+    ids: list[str] | None = None  # ids de cortes/montagens selecionados
+
+
+@app.post("/davinci/apply")
+async def dv_apply(req: DvApplyRequest):
+    src_name = _dv["source"]["name"] if _dv["source"] else "sequencia"
+    try:
+        if req.objective == "viral":
+            sel = [c for c in _dv["viral"] if req.ids is None or c.id in req.ids]
+            if not sel:
+                raise HTTPException(status_code=400, detail="Nenhum corte selecionado.")
+            cuts = [{"start": c.start, "end": c.end} for c in sel]
+            colors = [c.color for c in sel]
+            # aplica com cores por corte
+            result = await asyncio.to_thread(_dv_apply_colored, cuts, colors, f"Cortes Virais — {src_name}")
+        elif req.objective == "frankenbite":
+            sel = [m for m in _dv["montages"] if req.ids is None or m["id"] in req.ids]
+            if not sel:
+                raise HTTPException(status_code=400, detail="Nenhuma montagem selecionada.")
+            created = 0
+            for i, m in enumerate(sel):
+                cuts = [{"start": p["start"], "end": p["end"]} for p in m["pieces"]]
+                await asyncio.to_thread(davinci.apply_source_cuts, cuts, f"Montagem {i+1} — {src_name}", "Purple")
+                created += 1
+            result = {"sequences": created}
+        elif req.objective == "silences":
+            dur = _dv["source"]["duration_sec"] if _dv["source"] else 0.0
+            sil = remove_silences(_require_transcript(), duration_sec=dur)
+            cuts = [{"start": c["start"], "end": c["end"]} for c in sil["cuts"]]
+            result = await asyncio.to_thread(davinci.apply_source_cuts, cuts, f"Sem silencios — {src_name}", "Green")
+        else:
+            raise HTTPException(status_code=400, detail="Objetivo desconhecido.")
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return result
+
+
+def _dv_apply_colored(cuts: list, colors: list, name: str) -> dict:
+    """apply_source_cuts com uma cor por corte (para falas virais)."""
+    import core.adapters.davinci as dv
+    mpi, fps, _p, _n, _d = dv._get_main_source()
+    resolve = dv._bootstrap()
+    project = dv._current_project(resolve)
+    media_pool = project.GetMediaPool()
+    clip_infos = []
+    for c in cuts:
+        sf, ef = round(c["start"] * fps), round(c["end"] * fps)
+        if ef > sf:
+            clip_infos.append({"mediaPoolItem": mpi, "startFrame": sf, "endFrame": ef})
+    if not clip_infos:
+        raise RuntimeError("Nenhum corte valido.")
+    new_tl = media_pool.CreateTimelineFromClips(name, clip_infos)
+    if new_tl is None:
+        raise RuntimeError("CreateTimelineFromClips retornou None.")
+    items = new_tl.GetItemListInTrack("video", 1) or []
+    colored = 0
+    for i, item in enumerate(items):
+        if item.SetClipColor(colors[i] if i < len(colors) else "Blue"):
+            colored += 1
+    return {"applied": len(items), "colored": colored, "new_timeline_name": name, "warnings": []}

@@ -261,3 +261,99 @@ def apply_cuts(clips: list, new_timeline_name: str) -> dict:
         "new_timeline_name": new_timeline_name,
         "warnings": warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# Fluxo por ARQUIVO-FONTE (igual ao Premiere): transcreve o arquivo do clip
+# principal; cortes ja saem em tempo-de-origem, prontos p/ virar frames.
+# ---------------------------------------------------------------------------
+
+# Cores nomeadas do DaVinci (SetClipColor)
+_DAVINCI_COLORS = ["Blue", "Purple", "Orange", "Green", "Pink", "Teal", "Yellow", "Navy"]
+
+
+def _get_main_source():
+    """Retorna (media_pool_item, fps, path, name, duration_sec) do clip de video
+    mais longo da timeline ativa. Reencontrado a cada chamada (nao cacheia objeto
+    do Resolve entre requisicoes HTTP)."""
+    resolve = _bootstrap()
+    project = _current_project(resolve)
+    timeline = project.GetCurrentTimeline()
+    if timeline is None:
+        raise RuntimeError("Nenhuma timeline ativa. Abra uma timeline na pagina Edit.")
+
+    best, best_dur = None, -1
+    for t in range(1, timeline.GetTrackCount("video") + 1):
+        for item in timeline.GetItemListInTrack("video", t) or []:
+            if item.GetMediaPoolItem() is None:
+                continue
+            dur = item.GetDuration()
+            if dur > best_dur:
+                best_dur, best = dur, item
+    if best is None:
+        raise RuntimeError("Nenhum clip de video com midia na timeline ativa.")
+
+    mpi = best.GetMediaPoolItem()
+    props = mpi.GetClipProperty() or {}
+    path = props.get("File Path") or mpi.GetClipProperty("File Path")
+    if not path:
+        raise RuntimeError("Nao foi possivel obter o caminho do arquivo de origem.")
+    try:
+        fps = float(props.get("FPS") or float(timeline.GetSetting("timelineFrameRate")))
+    except (TypeError, ValueError):
+        fps = float(timeline.GetSetting("timelineFrameRate"))
+    try:
+        frames = int(props.get("Frames") or 0)
+    except (TypeError, ValueError):
+        frames = 0
+    duration = frames / fps if frames and fps else 0.0
+    name = props.get("Clip Name") or best.GetName() or "clip"
+    return mpi, fps, path, name, duration
+
+
+def get_source_media_path() -> dict:
+    """Metadados do arquivo-fonte (JSON-safe) para a UI. Nao modifica nada."""
+    _mpi, fps, path, name, duration = _get_main_source()
+    return {"path": path, "fps": fps, "name": name, "duration_sec": duration}
+
+
+def apply_source_cuts(cuts: list[dict], new_timeline_name: str, single_color: str | None = None) -> dict:
+    """Cria nova timeline com cortes em tempo-de-ORIGEM (segundos).
+    cuts: [{start, end}] em segundos do arquivo-fonte. Original intacta.
+    """
+    if not cuts:
+        raise RuntimeError("Nenhum corte para aplicar.")
+
+    mpi, fps, _path, _name, _dur = _get_main_source()
+    resolve = _bootstrap()
+    project = _current_project(resolve)
+    media_pool = project.GetMediaPool()
+
+    clip_infos = []
+    for c in cuts:
+        sf = round(c["start"] * fps)
+        ef = round(c["end"] * fps)
+        if ef <= sf:
+            continue
+        clip_infos.append({"mediaPoolItem": mpi, "startFrame": sf, "endFrame": ef})
+    if not clip_infos:
+        raise RuntimeError("Nenhum corte valido apos conversao para frames.")
+
+    new_timeline = media_pool.CreateTimelineFromClips(new_timeline_name, clip_infos)
+    if new_timeline is None:
+        raise RuntimeError("CreateTimelineFromClips retornou None — Resolve recusou a criacao.")
+
+    new_items = new_timeline.GetItemListInTrack("video", 1) or []
+    colored = 0
+    for i, item in enumerate(new_items):
+        color = single_color or _DAVINCI_COLORS[i % len(_DAVINCI_COLORS)]
+        if item.SetClipColor(color):
+            colored += 1
+
+    return {
+        "applied": len(new_items),
+        "expected": len(clip_infos),
+        "colored": colored,
+        "new_timeline_name": new_timeline_name,
+        "warnings": [],
+    }

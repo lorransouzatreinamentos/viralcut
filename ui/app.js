@@ -39,7 +39,8 @@ $("btnSelect").onclick = async () => {
       if (info.error) throw new Error(info.error);
       window.__source = info;
     } else {
-      info = await api("/timeline/select", { method: "POST" });
+      info = await api("/davinci/select", { method: "POST" });
+      window.__source = info;
     }
     $("tlInfo").innerHTML = `<b>${info.name}</b> · ${Math.round(info.duration_sec)}s · ${info.fps?.toFixed?.(2) || "?"} fps`;
     $("btnAnalyze").disabled = false;
@@ -51,10 +52,19 @@ $("btnAnalyze").onclick = async () => {
   $("btnAnalyze").disabled = true;
   $("progressWrap").style.display = "block";
   try {
-    if (!IS_PREMIERE) throw new Error("Disponível no Premiere. (DaVinci em breve.)");
-    transcript = await core().transcribe(window.__source, (p, t) => setP(p, t));
+    let words;
+    if (IS_PREMIERE) {
+      transcript = await core().transcribe(window.__source, (p, t) => setP(p, t));
+      words = transcript.words.length;
+    } else {
+      setP(30, "Transcrevendo (pode levar 1-2 min)…");
+      const r = await api("/davinci/transcribe", { method: "POST" });
+      transcript = true; // no DaVinci a transcrição fica no Core; a UI só precisa saber que existe
+      words = r.words;
+      setP(100, `${words} palavras`);
+    }
     $("objStep").style.display = "block";
-    $("analyzeDone").textContent = `✓ ${transcript.words.length} palavras transcritas — escolha um objetivo (pode repetir).`;
+    $("analyzeDone").textContent = `✓ ${words} palavras transcritas — escolha um objetivo (pode repetir).`;
   } catch (e) {
     setP(0, "");
     msg($("progressTxt"), e.message, "err");
@@ -81,13 +91,19 @@ async function runObjective(name) {
   $("applyMsg").innerHTML = "";
   try {
     if (name === "viral") {
-      currentData = await core().viralCuts(transcript, window.__source, {});
+      currentData = IS_PREMIERE
+        ? await core().viralCuts(transcript, window.__source, {})
+        : await api("/davinci/viral", { method: "POST" });
       renderClips(currentData.clips);
     } else if (name === "frankenbite") {
-      currentData = await core().frankenbite(transcript, window.__source, {});
+      currentData = IS_PREMIERE
+        ? await core().frankenbite(transcript, window.__source, {})
+        : await api("/davinci/frankenbite", { method: "POST" });
       renderMontages(currentData.montages);
     } else {
-      currentData = core().removeSilences(transcript, window.__source, {});
+      currentData = IS_PREMIERE
+        ? core().removeSilences(transcript, window.__source, {})
+        : { summary: await api("/davinci/silences", { method: "POST" }) };
       renderSilence(currentData.summary);
     }
     $("btnApply").style.display = "block";
@@ -133,7 +149,20 @@ function renderSilence(s) {
 $("btnApply").onclick = async () => {
   $("btnApply").disabled = true;
   try {
-    if (!IS_PREMIERE) throw new Error("Disponível no Premiere.");
+    // --- DaVinci: o Core Python aplica direto no Resolve ---
+    if (!IS_PREMIERE) {
+      const objMap = { viral: "viral", frankenbite: "frankenbite", silence: "silences" };
+      let ids = null;
+      if (currentObj === "viral" || currentObj === "frankenbite") {
+        ids = [...document.querySelectorAll('#results input:checked')].map((cb) => cb.dataset.id);
+        if (!ids.length) throw new Error("Selecione ao menos um item.");
+      }
+      $("applyMsg").innerHTML = `<div class="dim">Aplicando no Resolve…</div>`;
+      const r = await api("/davinci/apply", { method: "POST", body: { objective: objMap[currentObj], ids } });
+      if (r.sequences !== undefined) msg($("applyMsg"), `✓ ${r.sequences} montagem(ns) criada(s).`, "ok");
+      else msg($("applyMsg"), `✓ Timeline "${r.new_timeline_name}" criada (${r.applied} trechos).`, "ok");
+      return;
+    }
     const src = window.__source;
     const seqBase = src.name || "sequencia";
     let result;
@@ -173,7 +202,7 @@ $("title").onclick = async () => {
   const prev = $("host").textContent;
   $("host").textContent = "atualizando…";
   try {
-    if (IS_PREMIERE) await core().updatePanel(); else await api("/panel/update", { method: "POST" });
+    if (IS_PREMIERE) await core().updatePanel(); else await api("/update", { method: "POST" });
     location.reload();
   } catch (e) { $("host").textContent = prev; msg($("tlInfo"), "Falha ao atualizar: " + e.message, "err"); }
 };
@@ -194,6 +223,8 @@ async function hostVersionWithRetry(tries) {
     const build = await hostVersionWithRetry(4);
     if (build) ver += " · host " + build;
     else msg($("tlInfo"), "ExtendScript não carregou. Feche e reabra o painel (Window > Extensions). Se persistir, reinicie o Premiere.", "err");
+  } else {
+    try { ver = (await api("/version")).version || "dev"; } catch (e) {}
   }
   $("ver").textContent = ver;
 })();

@@ -111,6 +111,7 @@ class HighlightClip(BaseModel):
     score: int = Field(ge=0, le=100)
     motivo: str = ""
     hook_first_3s: str = ""
+    text: str = ""
     approved: bool = False
     color: str = "Blue"
 
@@ -153,6 +154,15 @@ def resolve_highlight(
     start = max(0.0, start_word.start - padding_sec)
     end = end_word.end + padding_sec
 
+    # texto completo dos segmentos (nao reconstruido das palavras, que o Whisper
+    # as vezes omite deixando o preview picotado)
+    seg_texts = []
+    for sid in range(raw.start_seg_id, raw.end_seg_id + 1):
+        try:
+            seg_texts.append(transcript.segment_by_id(sid).text)
+        except KeyError:
+            pass
+
     return HighlightClip(
         id=clip_id,
         titulo=raw.titulo,
@@ -163,6 +173,7 @@ def resolve_highlight(
         score=raw.score,
         motivo=raw.motivo,
         hook_first_3s=raw.hook_first_3s,
+        text=" ".join(seg_texts),
     )
 
 

@@ -1,71 +1,73 @@
 # VIRALCUT
 
-Extensão de cortes virais assistidos por IA para Adobe Premiere Pro e DaVinci Resolve Studio.
-Ver [`PLANO_MESTRE.md`](PLANO_MESTRE.md) para a especificação completa.
+Extensão de cortes virais com IA para **Adobe Premiere Pro** e **DaVinci Resolve Studio**.
 
-## Setup do Core (dev)
+Fluxo: seleciona a sequência → transcreve o áudio → escolhe um objetivo (reaplicável):
+1. **Falas virais** — extrai os melhores cortes diretos, cada um numa cor.
+2. **Montar falas** — costura trechos de vários momentos numa narrativa nova (frankenbite).
+3. **Remover silêncios** — corta as pausas e junta as falas.
+
+A transcrição é feita uma vez; depois você aplica quantos objetivos quiser na mesma timeline.
+
+---
+
+## Instalação no Windows (DaVinci Resolve **Studio**)
+
+> Requer DaVinci Resolve **Studio** (a versão gratuita não permite automação).
+
+**Pré-requisitos** (instale uma vez):
+- [Python 3.11+](https://python.org) — marque **"Add Python to PATH"** no instalador.
+- [Git](https://git-scm.com).
+- ffmpeg: no PowerShell, `winget install Gyan.FFmpeg` (depois reabra o PowerShell).
+
+**Instalar o VIRALCUT** (PowerShell):
+```powershell
+git clone https://github.com/lorransouzatreinamentos/viralcut.git
+cd viralcut
+powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
+```
+O instalador pede a chave da OpenAI e configura tudo. (O repositório é privado — você precisa estar convidado e autenticado no GitHub para o `git clone`.)
+
+**No DaVinci Resolve**, uma vez: `Preferences > System > General > External scripting using = **Local**`.
+
+**Usar:**
+1. Abra o Resolve com um projeto e uma timeline.
+2. Dê dois cliques em **`viralcut.bat`** (ou rode no terminal). Ele abre o app no navegador.
+3. Selecionar sequência → Analisar → escolher objetivo → Aplicar.
+
+**Atualizar:** clique na **logo ✂ VIRALCUT** no topo do app — ele puxa a versão nova do GitHub sozinho e recarrega.
+
+---
+
+## Instalação no Mac (Adobe Premiere Pro)
+
+Painel CEP self-contained. Ver `scripts/install-premiere.sh` e `PLANO_MESTRE.md`.
 
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # preencher chaves de API
+bash scripts/install-premiere.sh   # instala o painel + ativa debug mode
+# preencher a chave em ~/.viralcut/.env
 ```
+Reiniciar o Premiere → **Window > Extensions > VIRALCUT**.
 
-## Rodar
+---
 
-```bash
-source .venv/bin/activate
-uvicorn core.main:app --port 8756 --reload
-```
+## Estrutura
 
-Verificar: `curl http://127.0.0.1:8756/health`
+| Pasta | O quê |
+|-------|-------|
+| `core/` | Servidor Python (FastAPI) — motor do DaVinci: transcrição, IA, aplica no Resolve |
+| `core/objectives.py` | Montar falas (IA) + remover silêncios (algorítmico) |
+| `core/adapters/davinci.py` | Fala com a API do Resolve (source path + criar timelines) |
+| `premiere-panel/` | Painel CEP do Premiere (Node self-contained) |
+| `ui/` | Interface compartilhada (servida pelo Core no DaVinci) |
+| `install-windows.ps1` · `viralcut.bat` | Instalador e launcher Windows (DaVinci) |
+| `tests/` | 47 testes unitários + e2e |
 
-## Testes
+## Log
 
-```bash
-source .venv/bin/activate
-python -m pytest tests/ -v
-```
+Toda análise grava `~/.viralcut/logs/last-run.json` (o que foi enviado à IA, transcrito, retornado e aplicado) — útil para depurar e avaliar a qualidade dos cortes.
 
 ## Requisitos por plataforma
 
-- **Python 3.11+** (o modelo usa sintaxe `X | None`, incompatível com o Python 3.9 do macOS).
-- **DaVinci Resolve Studio** (versão paga) — scripting externo não funciona na versão gratuita. Ver `.env.example` para as variáveis `RESOLVE_SCRIPT_API`/`RESOLVE_SCRIPT_LIB`.
-- **Adobe Premiere Pro** — painel CEP (Bolt CEP), instalação separada em `premiere-panel/` (Fase 4).
-
-## Status
-
-**Fases 0–4 do Core construídas e testadas** (47 testes passando). Ver checklist completo em `PLANO_MESTRE.md` seção 20.
-
-| Fase | O que está pronto | Verificado |
-|------|-------------------|-----------|
-| 0 · Fundação | Core FastAPI, modelo de dados com invariantes de word-ID | ✅ testes + servidor |
-| 1 · Transcrição DaVinci | adapter (leitura timeline + export áudio) + pipeline Whisper (compressão/chunking) | ✅ testes (ffmpeg real) + endpoints |
-| 2 · Cortes virais IA | `viral.py` — IA responde só com IDs; timecode 100% derivado das palavras | ✅ testes (inclui prova estrutural anti-FastVideo) |
-| 3 · Aplicar DaVinci | `adapters/davinci.py` — CreateTimelineFromClips + SetClipColor + verificação | ✅ testes puros (frame-math) + mock da API Resolve |
-| 4 · Premiere | `premiere_plan.py` (tick-math testada) + `timeline.jsx` (ExtendScript, API verificada) + painel CEP + UI | ✅ plan/UI testados · ⏳ ExtendScript e install exigem Premiere para verificar |
-
-### Testado de verdade nesta máquina
-- 47 testes unitários (modelo, transcrição, IA, mapeamento de frames DaVinci, tick-math Premiere).
-- Compressão/split de áudio com **ffmpeg real** (áudio sintético).
-- Servidor sobe, todas as 8 rotas do contrato respondem e degradam com erro claro em PT-BR quando falta DaVinci/API key.
-- UI compartilhada renderiza e é servida em `/ui`.
-
-### Instalar e testar no Premiere (Premiere Pro 2026 detectado nesta máquina)
-
-```bash
-bash scripts/install-premiere.sh          # instala o painel CEP + ativa debug mode
-cp .env.example .env                       # e preencher OPENAI_API_KEY + ANTHROPIC_API_KEY
-.venv/bin/uvicorn core.main:app --port 8756  # deixar o Core rodando
-# reiniciar o Premiere -> Window > Extensions > VIRALCUT
-```
-
-Fluxo no painel: **Selecionar sequência** (lê a mídia-fonte via `getMediaPath`) → **Analisar cortes virais** (transcreve o arquivo + IA) → marcar cortes → **Aplicar** (cria nova sequência com os cortes coloridos; original intacta).
-
-### Falta verificar EM MÁQUINA COM O EDITOR
-- `timeline.jsx` rodando dentro do Premiere 2026 (createSubClip/createNewSequenceFromClips/setColorLabel) — **painel já instalado**, falta abrir e rodar.
-- Transcrição ponta a ponta com uma `OPENAI_API_KEY` real (o pipeline ffmpeg+parse está testado; falta a chamada real ao Whisper).
-- `adapters/davinci.py` contra um Resolve Studio aberto (a lógica está testada por mocks + funções puras).
-
-Nota: a captura de áudio do Premiere usa `getMediaPath` + ffmpeg (como o FastVideo) — **não precisa de preset `.epr`**.
+- **DaVinci:** Resolve **Studio** + Python 3.11+ + ffmpeg + chave OpenAI.
+- **Premiere:** Premiere Pro 2024+ + ffmpeg + chave OpenAI. Node é fornecido pelo CEP.
