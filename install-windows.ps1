@@ -22,9 +22,12 @@ function Refresh-Path {
 
 function Have($cmd) { return [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
 
+# So instala se REALMENTE nao existir. Nunca reinstala/atualiza algo que ja
+# esta no PC (importante: a maquina pode ter outras IAs usando esses mesmos
+# programas -- nao queremos mexer no que ja funciona).
 function Ensure($cmd, $wingetId, $label) {
-    if (Have $cmd) { Say "  [ja tem] $label" "DarkGray"; return }
-    Say "  [baixando] $label ..." "Yellow"
+    if (Have $cmd) { Say "  [ja tem, nao mexi] $label" "DarkGray"; return }
+    Say "  [baixando] $label (nao encontrado no PC) ..." "Yellow"
     winget install --id $wingetId -e --silent --accept-package-agreements --accept-source-agreements | Out-Null
     Refresh-Path
     if (Have $cmd) { Say "  [ok] $label instalado" "Green" }
@@ -49,29 +52,59 @@ Step "2/6  Instalando os programas necessarios"
 Ensure "git"    "Git.Git"     "Git"
 Ensure "ffmpeg" "Gyan.FFmpeg" "ffmpeg (extrai o audio do video)"
 
-# Python: o Windows tem um atalho falso de 'python' que abre a Microsoft Store.
-# Por isso testamos se o comando REALMENTE roda, e preferimos o launcher 'py'.
-function Test-Python($cmd) {
-    try { & $cmd --version 2>&1 | Out-Null; return ($LASTEXITCODE -eq 0) } catch { return $false }
-}
-function Find-Python {
-    if ((Have py)     -and (Test-Python "py"))     { return "py" }
-    if ((Have python) -and (Test-Python "python")) { return "python" }
+# Python: o VIRALCUT precisa de 3.10+ (usa sintaxe moderna de tipos). O PC pode
+# ja ter um Python mais antigo rodando outras IAs -- NUNCA mexemos nesse. Se o
+# que ja existe for velho demais, instalamos o 3.11 AO LADO (o launcher 'py' do
+# Windows deixa varias versoes convivendo sem conflito) e usamos so esse, sem
+# tocar no 'python'/'py' padrao que outra ferramenta ja usa.
+$MinMajor = 3; $MinMinor = 10
+
+function Get-PyVersion($exe, $verArgs) {
+    try {
+        $out = & $exe @verArgs --version 2>&1
+        if ($out -match "Python (\d+)\.(\d+)") { return @([int]$matches[1], [int]$matches[2]) }
+    } catch {}
     return $null
 }
-$PY = Find-Python
-if (-not $PY) {
-    Say "  [baixando] Python 3.11 ..." "Yellow"
+function Version-Ok($v) {
+    if (-not $v) { return $false }
+    return ($v[0] -gt $MinMajor) -or ($v[0] -eq $MinMajor -and $v[1] -ge $MinMinor)
+}
+
+$PyExe = $null; $PyArgs = @()
+
+# 1) o Windows tem um atalho falso de 'python' que so abre a Microsoft Store --
+#    por isso testamos se o comando REALMENTE roda e reporta uma versao.
+if (Have py) {
+    foreach ($v in "3.13", "3.12", "3.11", "3.10") {
+        $ver = Get-PyVersion "py" @("-$v")
+        if (Version-Ok $ver) { $PyExe = "py"; $PyArgs = @("-$v"); break }
+    }
+}
+if (-not $PyExe) {
+    foreach ($cand in @("py", "python")) {
+        if (Have $cand) {
+            $ver = Get-PyVersion $cand @()
+            if (Version-Ok $ver) { $PyExe = $cand; $PyArgs = @(); break }
+        }
+    }
+}
+
+# 2) nada compativel foi encontrado (ou nao existe, ou e antigo demais) ->
+#    instala o 3.11 AO LADO, sem substituir o que ja esta la.
+if (-not $PyExe) {
+    Say "  [baixando] Python 3.11 (instala ao lado do que ja existe, sem substituir)..." "Yellow"
     winget install --id Python.Python.3.11 -e --silent --accept-package-agreements --accept-source-agreements | Out-Null
     Refresh-Path
-    $PY = Find-Python
+    $ver = Get-PyVersion "py" @("-3.11")
+    if (Version-Ok $ver) { $PyExe = "py"; $PyArgs = @("-3.11") }
 }
-if (-not $PY) {
-    Say "`nPython foi instalado, mas esta janela ainda nao enxerga." "Yellow"
+if (-not $PyExe) {
+    Say "`nPython 3.10+ nao encontrado mesmo apos instalar." "Yellow"
     Say "FECHE o PowerShell, abra de novo e rode este script novamente." "Yellow"
     exit 1
 }
-Say "  [ok] Python encontrado ($PY)" "Green"
+Say "  [ok] usando $PyExe $($PyArgs -join ' ') (versoes/instalacoes existentes nao foram alteradas)" "Green"
 
 # ---------------------------------------------------------------------
 Step "3/6  Baixando o VIRALCUT"
@@ -101,7 +134,7 @@ Set-Location $Dest
 
 # ---------------------------------------------------------------------
 Step "4/6  Preparando o ambiente Python"
-if (-not (Test-Path ".venv")) { & $PY -m venv .venv }
+if (-not (Test-Path ".venv")) { & $PyExe @PyArgs -m venv .venv }
 & .\.venv\Scripts\python.exe -m pip install --quiet --upgrade pip
 & .\.venv\Scripts\pip.exe install --quiet -r requirements.txt
 Say "  [ok] dependencias instaladas" "Green"
