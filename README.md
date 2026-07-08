@@ -13,29 +13,32 @@ A transcrição é feita uma vez; depois você aplica quantos objetivos quiser n
 
 ## Instalação no Windows (DaVinci Resolve **Studio**)
 
-> Requer DaVinci Resolve **Studio** (a versão gratuita não permite automação).
+> Único pré-requisito que você precisa ter: **DaVinci Resolve Studio** (a versão gratuita não permite automação) e uma **chave da OpenAI**.
+> O instalador baixa e instala sozinho tudo o mais (Git, Python, ffmpeg).
 
-**Pré-requisitos** (instale uma vez):
-- [Python 3.11+](https://python.org) — marque **"Add Python to PATH"** no instalador.
-- [Git](https://git-scm.com).
-- ffmpeg: no PowerShell, `winget install Gyan.FFmpeg` (depois reabra o PowerShell).
+**Passo único** — salve o `install-windows.ps1` numa pasta e, no PowerShell, rode:
 
-**Instalar o VIRALCUT** (PowerShell):
 ```powershell
-git clone https://github.com/lorransouzatreinamentos/viralcut.git
-cd viralcut
 powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 ```
-O instalador pede a chave da OpenAI e configura tudo. (O repositório é privado — você precisa estar convidado e autenticado no GitHub para o `git clone`.)
 
-**No DaVinci Resolve**, uma vez: `Preferences > System > General > External scripting using = **Local**`.
+Ele vai:
+1. Instalar **Git**, **Python 3.11** e **ffmpeg** (via `winget`, já embutido no Windows 10/11).
+2. Baixar o VIRALCUT para `C:\Users\<você>\viralcut`.
+3. Montar o ambiente Python e instalar as dependências.
+4. Pedir a **chave da OpenAI** e salvá-la.
+5. Criar um atalho **VIRALCUT** na área de trabalho.
+
+> Se o repositório for privado, você precisa estar convidado como colaborador — o Git pede login no navegador na hora de baixar.
+
+**No DaVinci Resolve**, uma vez só: `Preferences > System > General > External scripting using = **Local**`.
 
 **Usar:**
-1. Abra o Resolve com um projeto e uma timeline.
-2. Dê dois cliques em **`viralcut.bat`** (ou rode no terminal). Ele abre o app no navegador.
+1. Abra o Resolve (Studio) com um projeto e uma timeline.
+2. Clique no atalho **VIRALCUT** na área de trabalho — o app abre no navegador.
 3. Selecionar sequência → Analisar → escolher objetivo → Aplicar.
 
-**Atualizar:** clique na **logo ✂ VIRALCUT** no topo do app — ele puxa a versão nova do GitHub sozinho e recarrega.
+**Atualizar:** clique na **logo ✂ VIRALCUT** no topo do app — ele puxa a versão nova do GitHub e recarrega sozinho.
 
 ---
 

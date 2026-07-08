@@ -1,42 +1,147 @@
-# VIRALCUT — instalador Windows (DaVinci Resolve Studio)
-# Uso: abra o PowerShell na pasta do projeto e rode:
-#   powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
+# =====================================================================
+#  VIRALCUT - instalador completo (Windows + DaVinci Resolve Studio)
+#
+#  Instala TUDO que falta (Git, Python, ffmpeg), baixa o app, configura
+#  o ambiente e cria um atalho na area de trabalho.
+#
+#  Como rodar (PowerShell, como usuario normal):
+#     powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
+# =====================================================================
 $ErrorActionPreference = "Stop"
-Write-Host "== VIRALCUT — instalacao ==" -ForegroundColor Cyan
+$RepoUrl = "https://github.com/lorransouzatreinamentos/viralcut.git"
 
-function Need($cmd, $hint) {
-  if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
-    Write-Host "FALTA: $cmd" -ForegroundColor Red
-    Write-Host "  $hint" -ForegroundColor Yellow
+function Say($msg, $color = "White") { Write-Host $msg -ForegroundColor $color }
+function Step($msg) { Say "`n>> $msg" "Cyan" }
+
+function Refresh-Path {
+    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+                [Environment]::GetEnvironmentVariable("Path", "User")
+}
+
+function Have($cmd) { return [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
+
+function Ensure($cmd, $wingetId, $label) {
+    if (Have $cmd) { Say "  [ja tem] $label" "DarkGray"; return }
+    Say "  [baixando] $label ..." "Yellow"
+    winget install --id $wingetId -e --silent --accept-package-agreements --accept-source-agreements | Out-Null
+    Refresh-Path
+    if (Have $cmd) { Say "  [ok] $label instalado" "Green" }
+    else { Say "  [aviso] $label instalado, mas o PATH so atualiza numa nova janela." "Yellow" }
+}
+
+Say "=====================================" "Cyan"
+Say "   VIRALCUT - instalacao automatica" "Cyan"
+Say "=====================================" "Cyan"
+
+# ---------------------------------------------------------------------
+Step "1/5  Verificando o winget (gerenciador de pacotes do Windows)"
+if (-not (Have winget)) {
+    Say "winget nao encontrado." "Red"
+    Say "Instale o 'App Installer' pela Microsoft Store e rode este script de novo." "Yellow"
     exit 1
-  }
 }
+Say "  [ok] winget disponivel" "Green"
 
-# 1. Pre-requisitos
-Need python "Instale Python 3.11+ em https://python.org (marque 'Add Python to PATH')."
-Need git    "Instale o Git em https://git-scm.com."
-if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
-  Write-Host "AVISO: ffmpeg nao encontrado. Instale com:  winget install Gyan.FFmpeg" -ForegroundColor Yellow
-  Write-Host "  (depois feche e reabra o PowerShell)"
+# ---------------------------------------------------------------------
+Step "2/5  Instalando os programas necessarios"
+Ensure "git"    "Git.Git"     "Git"
+Ensure "ffmpeg" "Gyan.FFmpeg" "ffmpeg (extrai o audio do video)"
+
+# Python: o Windows tem um atalho falso de 'python' que abre a Microsoft Store.
+# Por isso testamos se o comando REALMENTE roda, e preferimos o launcher 'py'.
+function Test-Python($cmd) {
+    try { & $cmd --version 2>&1 | Out-Null; return ($LASTEXITCODE -eq 0) } catch { return $false }
 }
+function Find-Python {
+    if ((Have py)     -and (Test-Python "py"))     { return "py" }
+    if ((Have python) -and (Test-Python "python")) { return "python" }
+    return $null
+}
+$PY = Find-Python
+if (-not $PY) {
+    Say "  [baixando] Python 3.11 ..." "Yellow"
+    winget install --id Python.Python.3.11 -e --silent --accept-package-agreements --accept-source-agreements | Out-Null
+    Refresh-Path
+    $PY = Find-Python
+}
+if (-not $PY) {
+    Say "`nPython foi instalado, mas esta janela ainda nao enxerga." "Yellow"
+    Say "FECHE o PowerShell, abra de novo e rode este script novamente." "Yellow"
+    exit 1
+}
+Say "  [ok] Python encontrado ($PY)" "Green"
 
-# 2. Ambiente Python
-Write-Host "Criando ambiente e instalando dependencias..."
-python -m venv .venv
+# ---------------------------------------------------------------------
+Step "3/5  Baixando o VIRALCUT"
+# Se este script ja esta dentro do repo (usuario clonou antes), usa essa pasta.
+if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "requirements.txt"))) {
+    $Dest = $PSScriptRoot
+    Say "  usando o repositorio ja baixado em $Dest" "DarkGray"
+    git -C $Dest pull --ff-only 2>$null
+} else {
+    $Dest = Join-Path $env:USERPROFILE "viralcut"
+    if (Test-Path (Join-Path $Dest ".git")) {
+        Say "  ja existe em $Dest - atualizando..." "DarkGray"
+        git -C $Dest pull --ff-only
+    } else {
+        Say "  clonando para $Dest" "DarkGray"
+        Say "  (se pedir login do GitHub, autorize no navegador)" "DarkGray"
+        git clone $RepoUrl $Dest
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $Dest ".git"))) {
+            Say "`nFalha ao baixar o repositorio." "Red"
+            Say "Se ele e privado, peca ao Lorran para te adicionar como colaborador" "Yellow"
+            Say "no GitHub, e faca login quando o Git pedir." "Yellow"
+            exit 1
+        }
+    }
+}
+Set-Location $Dest
+
+# ---------------------------------------------------------------------
+Step "4/5  Preparando o ambiente Python"
+if (-not (Test-Path ".venv")) { & $PY -m venv .venv }
 & .\.venv\Scripts\python.exe -m pip install --quiet --upgrade pip
 & .\.venv\Scripts\pip.exe install --quiet -r requirements.txt
+Say "  [ok] dependencias instaladas" "Green"
 
-# 3. Chave da OpenAI -> %USERPROFILE%\.viralcut\.env
-$key = Read-Host "Cole a chave da OpenAI (sk-...)"
-$vcdir = Join-Path $env:USERPROFILE ".viralcut"
-New-Item -ItemType Directory -Force -Path $vcdir | Out-Null
-$envPath = Join-Path $vcdir ".env"
-$content = "OPENAI_API_KEY=$key`r`nVIRALCUT_LLM=openai`r`nVIRALCUT_LLM_MODEL=gpt-4o`r`n"
-[System.IO.File]::WriteAllText($envPath, $content, (New-Object System.Text.UTF8Encoding($false)))
+# ---------------------------------------------------------------------
+Step "5/5  Configurando a chave da OpenAI"
+$VcDir   = Join-Path $env:USERPROFILE ".viralcut"
+$EnvFile = Join-Path $VcDir ".env"
+New-Item -ItemType Directory -Force -Path $VcDir | Out-Null
+if (Test-Path $EnvFile) {
+    Say "  [ja tem] chave configurada em $EnvFile" "DarkGray"
+} else {
+    $key = Read-Host "  Cole a chave da OpenAI (comeca com sk-)"
+    $content = "OPENAI_API_KEY=$key`r`nVIRALCUT_LLM=openai`r`nVIRALCUT_LLM_MODEL=gpt-4o`r`n"
+    [System.IO.File]::WriteAllText($EnvFile, $content, (New-Object System.Text.UTF8Encoding($false)))
+    Say "  [ok] chave salva" "Green"
+}
 
-Write-Host ""
-Write-Host "OK! Instalado." -ForegroundColor Green
-Write-Host "Para usar:"
-Write-Host "  1. No DaVinci Resolve: Preferences > System > General >" -ForegroundColor White
-Write-Host "     'External scripting using' = Local" -ForegroundColor White
-Write-Host "  2. Abra o Resolve com uma timeline, entao rode:  .\viralcut.bat" -ForegroundColor White
+# ---------------------------------------------------------------------
+# Atalho na area de trabalho
+try {
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    $ws = New-Object -ComObject WScript.Shell
+    $lnk = $ws.CreateShortcut((Join-Path $desktop "VIRALCUT.lnk"))
+    $lnk.TargetPath       = Join-Path $Dest "viralcut.bat"
+    $lnk.WorkingDirectory = $Dest
+    $lnk.Save()
+    Say "`n  [ok] atalho 'VIRALCUT' criado na area de trabalho" "Green"
+} catch { Say "  (nao consegui criar o atalho - use o viralcut.bat na pasta)" "DarkGray" }
+
+# ---------------------------------------------------------------------
+Say "`n=====================================" "Green"
+Say "   PRONTO!" "Green"
+Say "=====================================" "Green"
+Say ""
+Say "Falta so 1 ajuste no DaVinci (uma vez so):" "White"
+Say "  Preferences > System > General >" "White"
+Say "  'External scripting using' = Local" "Yellow"
+Say ""
+Say "Para usar:" "White"
+Say "  1. Abra o DaVinci Resolve (Studio) com um projeto e uma timeline" "White"
+Say "  2. Clique no atalho VIRALCUT na area de trabalho" "White"
+Say "  3. O app abre no navegador. Selecionar -> Analisar -> Objetivo -> Aplicar" "White"
+Say ""
+Say "Para atualizar depois: clique na logo do app (canto superior esquerdo)." "DarkGray"
