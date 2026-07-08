@@ -1,15 +1,23 @@
 """
-Transcricao word-level via OpenAI Whisper API (ver PLANO_MESTRE.md secoes 6, 9.1, 16).
+Transcricao word-level (ver PLANO_MESTRE.md secoes 6, 9.1, 16).
 
-Fluxo: audio bruto (WAV, exportado pelo adapter) -> comprime p/ MP3 16kHz mono
-(cabe no limite de 25MB do Whisper p/ a maioria dos videos) -> se ainda exceder,
-divide em pedacos -> transcreve cada pedaco -> soma o offset de tempo de cada
-pedaco aos timestamps -> junta tudo num TranscriptState so.
+Duas engines, tentadas nesta ordem (transparente pro resto do app):
+  1. LOCAL (faster-whisper, via local_transcribe.py) -- gratis, offline, privado.
+     So roda se o pacote estiver instalado (`pip install faster-whisper`); opcional,
+     nao e dependencia obrigatoria. Se nao estiver, cai pra API sem erro visivel.
+  2. API (OpenAI Whisper na nuvem) -- sempre funciona se houver OPENAI_API_KEY.
+
+Fluxo cloud: audio bruto -> comprime p/ MP3 16kHz mono (cabe no limite de 25MB
+do Whisper p/ a maioria dos videos) -> se ainda exceder, divide em pedacos ->
+transcreve cada pedaco -> soma o offset de tempo -> junta tudo num TranscriptState.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import httpx
@@ -19,6 +27,10 @@ from core.model import Segment, TranscriptState, Word
 
 WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
 CHUNK_LIMIT_BYTES = 24 * 1024 * 1024  # abaixo do limite de 25MB do Whisper (margem de seguranca)
+
+# Script compartilhado com o painel Premiere (Node chama o mesmo arquivo via
+# subprocess) -- uma unica implementacao da engine local, ver o proprio arquivo.
+_LOCAL_SCRIPT = Path(__file__).resolve().parent.parent / "premiere-panel" / "host" / "local_transcribe.py"
 
 
 def compress_audio_for_whisper(input_path: str, output_dir: str) -> str:
@@ -144,8 +156,47 @@ def merge_transcript_states(chunks: list[TranscriptState]) -> TranscriptState:
     return TranscriptState(words=all_words, segments=all_segments)
 
 
+def _try_local_transcribe_sync(audio_path: str, language: str) -> TranscriptState | None:
+    """Tenta a engine local (faster-whisper). Retorna None em QUALQUER falha
+    (script ausente, pacote nao instalado, erro de inferencia) -- o chamador
+    cai para a API sem quebrar a analise. Nunca levanta excecao."""
+    if not _LOCAL_SCRIPT.exists():
+        return None
+    try:
+        # sys.executable (nao "python3" fixo) -- garante o MESMO interprete que
+        # esta rodando este processo (o venv onde faster-whisper foi instalado).
+        # "python3" fixo nao existiria no Windows (venv la so tem python.exe).
+        result = subprocess.run(
+            [sys.executable, str(_LOCAL_SCRIPT), audio_path, language],
+            capture_output=True, text=True, timeout=1800,
+        )
+    except Exception:  # noqa: BLE001 -- python3 ausente, timeout, etc: fallback silencioso
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if "error" in data:
+        return None
+    try:
+        words = [Word(**w) for w in data.get("words", [])]
+        segments = [Segment(**s) for s in data.get("segments", [])]
+        return TranscriptState(words=words, segments=segments)
+    except Exception:  # noqa: BLE001 -- schema inesperado: fallback
+        return None
+
+
 async def transcribe_timeline_audio(raw_audio_path: str, output_dir: str, language: str = "pt") -> TranscriptState:
-    """Orquestra o pipeline completo: comprime -> divide se preciso -> transcreve -> junta."""
+    """Orquestra a transcricao: tenta local primeiro (gratis, offline), cai pra
+    API se indisponivel. Fluxo da API: comprime -> divide se preciso -> transcreve
+    -> junta. VIRALCUT_TRANSCRIBE=api no .env forca sempre a nuvem."""
+    if settings.transcribe_engine != "api":
+        local = await asyncio.to_thread(_try_local_transcribe_sync, raw_audio_path, language)
+        if local is not None and local.segments:
+            return local
+
     compressed = compress_audio_for_whisper(raw_audio_path, output_dir)
     chunks = split_audio_if_needed(compressed, output_dir)
 

@@ -40,6 +40,11 @@
     "C:\\ffmpeg\\bin\\ffmpeg.exe", "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe"
   ];
 
+  // Script compartilhado com o Core Python (mesma implementacao da engine local,
+  // ver o proprio arquivo). Fica em premiere-panel/host/ -- co-localizado com
+  // este arquivo (client/), sobrevive ao install (pasta inteira e copiada).
+  var LOCAL_TRANSCRIBE_SCRIPT = path.join(__dirname, "..", "host", "local_transcribe.py");
+
   // ---------------------------------------------------------------------------
   // LOG — registra tudo (enviado, transcrito, retornado, plano, aplicado) em disco
   // ---------------------------------------------------------------------------
@@ -150,6 +155,48 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
     if (e.indexOf(".wav") >= 0) return "audio/wav";
     if (e.indexOf(".m4a") >= 0) return "audio/mp4";
     return "application/octet-stream";
+  }
+
+  // ---------------------------------------------------------------------------
+  // Transcricao LOCAL (opcional): tenta faster-whisper via python antes da nuvem.
+  // Gratis, offline. So funciona se o usuario tiver instalado (pip install
+  // faster-whisper) -- se nao tiver, retorna null e o chamador cai pra API.
+  // ---------------------------------------------------------------------------
+  function pythonCandidates() {
+    // ponytail: assume o venv no local padrao do instalador (~/viralcut/.venv).
+    // Se o repo foi clonado em outro lugar, cai pros comandos genericos abaixo.
+    var venvPy = process.platform === "win32"
+      ? path.join(HOME, "viralcut", ".venv", "Scripts", "python.exe")
+      : path.join(HOME, "viralcut", ".venv", "bin", "python");
+    return [venvPy, "python3", "python"];
+  }
+
+  function runPython(exe, args) {
+    return new Promise(function (resolve) {
+      childProcess.execFile(
+        exe, args, { timeout: 1800000, maxBuffer: 50 * 1024 * 1024 },
+        function (err, stdout) { resolve(err ? null : stdout); }
+      );
+    });
+  }
+
+  async function transcribeLocal(audioPath, language) {
+    if (!fs.existsSync(LOCAL_TRANSCRIBE_SCRIPT)) return null;
+    var candidates = pythonCandidates();
+    for (var i = 0; i < candidates.length; i++) {
+      var exe = candidates[i];
+      if (path.isAbsolute(exe) && !fs.existsSync(exe)) continue;
+      var out = await runPython(exe, [LOCAL_TRANSCRIBE_SCRIPT, audioPath, language || "pt"]);
+      if (!out) continue;
+      var data;
+      try { data = JSON.parse(out); } catch (e) { continue; }
+      if (!data || data.error) continue;
+      var words = (data.words || []).filter(function (w) { return w.end > w.start; });
+      var segments = (data.segments || []).filter(function (s) { return s.end > s.start; });
+      if (!segments.length) continue;
+      return { words: words, segments: segments };
+    }
+    return null;
   }
 
   async function whisperTranscribe(mp3Path, apiKey) {
@@ -468,22 +515,29 @@ A montagem tem que soar como UMA fala contínua e proposital.
   async function transcribe(source, onProgress) {
     onProgress = onProgress || function () {};
     logReset(source);
-    var apiKey = readOpenAIKey();
 
-    onProgress(20, "Extraindo áudio…");
-    var mp3 = await extractAudio(source.path);
+    onProgress(15, "Tentando transcrição local (grátis)…");
+    var transcript = await transcribeLocal(source.path, "pt");
+    var usedLocal = !!transcript;
 
-    onProgress(55, "Transcrevendo (Whisper)…");
-    var transcript = await whisperTranscribe(mp3, apiKey);
-    try { fs.unlinkSync(mp3); } catch (e) {}
+    if (!transcript) {
+      var apiKey = readOpenAIKey();
+      onProgress(20, "Extraindo áudio…");
+      var mp3 = await extractAudio(source.path);
+      onProgress(55, "Transcrevendo (Whisper API)…");
+      transcript = await whisperTranscribe(mp3, apiKey);
+      try { fs.unlinkSync(mp3); } catch (e) {}
+    }
+
     if (!transcript.segments.length) throw new Error("Nenhuma fala detectada no vídeo.");
 
     logSet("whisper", {
+      engine: usedLocal ? "local (faster-whisper)" : "api (OpenAI)",
       words: transcript.words.length,
       segments: transcript.segments.length,
       full_text: transcript.segments.map(function (s) { return s.text; }).join(" ")
     });
-    onProgress(100, transcript.words.length + " palavras transcritas");
+    onProgress(100, transcript.words.length + " palavras (" + (usedLocal ? "local" : "nuvem") + ")");
     return transcript;
   }
 
