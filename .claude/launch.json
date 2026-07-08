@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "viralcut-core",
+      "runtimeExecutable": ".venv/bin/uvicorn",
+      "runtimeArgs": ["core.main:app", "--port", "8756"],
+      "port": 8756
+    }
+  ]
+}

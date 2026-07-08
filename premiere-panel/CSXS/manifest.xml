@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Painel CEP do VIRALCUT para Premiere Pro. Carrega a UI compartilhada
+     (servida pelo Core em http://127.0.0.1:8756/ui) e injeta o bridge
+     ExtendScript (host/timeline.jsx). Ver PLANO_MESTRE.md secoes 10, 14. -->
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.viralcut.panel"
+    ExtensionBundleVersion="0.1.0" ExtensionBundleName="VIRALCUT"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ExtensionList>
+    <Extension Id="com.viralcut.panel.main" Version="0.1.0"/>
+  </ExtensionList>
+  <ExecutionEnvironment>
+    <HostList>
+      <!-- PPRO = Premiere Pro. Faixa ampla (cobre 2022..2026+), igual ao FastVideo. -->
+      <Host Name="PPRO" Version="[22.0,99.9]"/>
+    </HostList>
+    <LocaleList><Locale Code="All"/></LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="9.0"/>
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+  <DispatchInfoList>
+    <Extension Id="com.viralcut.panel.main">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./client/index.html</MainPath>
+          <ScriptPath>./host/bundle.jsx</ScriptPath>
+          <CEFCommandLine>
+            <!-- Node habilitado: o painel roda ffmpeg + Whisper + GPT sozinho,
+                 sem servidor separado (elimina o "Failed to fetch"). -->
+            <Parameter>--allow-file-access</Parameter>
+            <Parameter>--allow-file-access-from-files</Parameter>
+            <Parameter>--enable-nodejs</Parameter>
+            <Parameter>--mixed-context</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle><AutoVisible>true</AutoVisible></Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>VIRALCUT</Menu>
+          <Geometry>
+            <Size><Height>580</Height><Width>360</Width></Size>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>

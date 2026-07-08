@@ -1,0 +1,1 @@
+window.__VIRALCUT_VERSION = "V.08.07.26.00.53";
