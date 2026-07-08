@@ -488,6 +488,7 @@ def _dv_apply_colored(cuts: list, colors: list, name: str) -> dict:
     resolve = dv._bootstrap()
     project = dv._current_project(resolve)
     media_pool = project.GetMediaPool()
+    dv._set_output_folder(media_pool, name)  # pasta por timeline
     clip_infos = []
     for c in cuts:
         sf, ef = round(c["start"] * fps), round(c["end"] * fps)

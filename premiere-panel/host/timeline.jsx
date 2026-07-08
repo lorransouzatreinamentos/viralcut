@@ -122,6 +122,14 @@ var VIRALCUT = (function () {
         var cuts = plan.cuts || [];
         if (!cuts.length) return JSON.stringify({ error: "plano sem cortes." });
 
+        // Pasta (bin) por timeline: agrupa a sequencia + os subclipes, mantendo o
+        // painel de projeto limpo. Se createBin falhar, cai para a raiz.
+        var bin = app.project.rootItem;
+        try {
+            var made = app.project.rootItem.createBin(plan.new_sequence_name);
+            if (made && made !== 0) bin = made;
+        } catch (eBin) {}
+
         var subclips = [];
         var warnings = [];
 
@@ -139,8 +147,8 @@ var VIRALCUT = (function () {
                 warnings.push("corte '" + cut.titulo + "': createSubClip falhou — pulado");
                 continue;
             }
-            // Cor vai no projectItem do subclip (existe aqui; NAO no trackItem)
             try { sub.setColorLabel(cut.label_index); } catch (eCol) {}
+            try { if (bin !== app.project.rootItem) sub.moveBin(bin); } catch (eMove) {}
             subclips.push(sub);
         }
 
@@ -149,8 +157,9 @@ var VIRALCUT = (function () {
         }
 
         // createNewSequenceFromClips insere os subclips sequencialmente e encaixados,
-        // numa sequencia nova (original intacta), derivando settings do 1o clip.
-        var newSeq = app.project.createNewSequenceFromClips(plan.new_sequence_name, subclips);
+        // na nova sequencia (original intacta), derivando settings do 1o clip.
+        // 3o arg = bin de destino -> a sequencia nasce dentro da pasta.
+        var newSeq = app.project.createNewSequenceFromClips(plan.new_sequence_name, subclips, bin);
         if (!newSeq || newSeq === 0) {
             return JSON.stringify({ error: "createNewSequenceFromClips falhou.", warnings: warnings });
         }
@@ -159,6 +168,7 @@ var VIRALCUT = (function () {
             ok: true,
             new_sequence_name: plan.new_sequence_name,
             created: subclips.length,
+            binned: (bin !== app.project.rootItem),
             warnings: warnings
         });
       } catch (e) {

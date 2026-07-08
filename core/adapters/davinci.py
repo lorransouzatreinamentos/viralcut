@@ -272,6 +272,24 @@ def apply_cuts(clips: list, new_timeline_name: str) -> dict:
 _DAVINCI_COLORS = ["Blue", "Purple", "Orange", "Green", "Pink", "Teal", "Yellow", "Navy"]
 
 
+def _set_output_folder(media_pool, name: str):
+    """Cria (ou reusa) uma subpasta no Media Pool e a torna a atual, para as
+    timelines novas nascerem organizadas em vez de soltas na raiz."""
+    try:
+        root = media_pool.GetRootFolder()
+        target = None
+        for f in root.GetSubFolderList() or []:
+            if f.GetName() == name:
+                target = f
+                break
+        if target is None:
+            target = media_pool.AddSubFolder(root, name)
+        if target:
+            media_pool.SetCurrentFolder(target)
+    except Exception:  # noqa: BLE001 — organizacao e best-effort, nunca derruba o apply
+        pass
+
+
 def _get_main_source():
     """Retorna (media_pool_item, fps, path, name, duration_sec) do clip de video
     mais longo da timeline ativa. Reencontrado a cada chamada (nao cacheia objeto
@@ -328,6 +346,7 @@ def apply_source_cuts(cuts: list[dict], new_timeline_name: str, single_color: st
     resolve = _bootstrap()
     project = _current_project(resolve)
     media_pool = project.GetMediaPool()
+    _set_output_folder(media_pool, new_timeline_name)  # pasta por timeline (organiza o Media Pool)
 
     clip_infos = []
     for c in cuts:
