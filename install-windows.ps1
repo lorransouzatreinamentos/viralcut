@@ -139,6 +139,14 @@ if (-not (Test-Path ".venv")) { & $PyExe @PyArgs -m venv .venv }
 & .\.venv\Scripts\pip.exe install --quiet -r requirements.txt
 Say "  [ok] dependencias instaladas" "Green"
 
+Say "  [baixando] transcricao local (faster-whisper -- gratis, offline)..." "Yellow"
+& .\.venv\Scripts\pip.exe install --quiet faster-whisper
+if ($LASTEXITCODE -eq 0) {
+    Say "  [ok] transcricao local instalada (o modelo baixa na primeira analise, ~466MB)" "Green"
+} else {
+    Say "  [aviso] nao consegui instalar a transcricao local -- sem problema, o app usa a API da OpenAI." "Yellow"
+}
+
 # ---------------------------------------------------------------------
 Step "5/6  Configurando a chave da OpenAI"
 $VcDir   = Join-Path $env:USERPROFILE ".viralcut"
@@ -213,6 +221,8 @@ try {
 Say "`n=====================================" "Green"
 Say "   PRONTO!" "Green"
 Say "=====================================" "Green"
+Say "Transcricao local (gratis) instalada -- na primeira analise, o app baixa" "DarkGray"
+Say "um modelo (~466MB, uma vez so) antes de transcrever." "DarkGray"
 
 Say "`n--- DAVINCI RESOLVE ---" "Cyan"
 Say "Ajuste unico (uma vez so):" "White"
