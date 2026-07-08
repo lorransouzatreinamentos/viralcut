@@ -103,6 +103,7 @@ var VIRALCUT = (function () {
             project_item_id: best.projectItem.nodeId,
             fps: fps,
             name: best.name,
+            timeline_name: seq.name,   // sequencia aberta (a UI mostra os dois)
             duration_sec: bestDur / TICKS_PER_SEC
         });
       } catch (e) {

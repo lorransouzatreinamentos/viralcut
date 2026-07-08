@@ -42,7 +42,14 @@ $("btnSelect").onclick = async () => {
       info = await api("/davinci/select", { method: "POST" });
       window.__source = info;
     }
-    $("tlInfo").innerHTML = `<b>${info.name}</b> · ${Math.round(info.duration_sec)}s · ${info.fps?.toFixed?.(2) || "?"} fps`;
+    // Mostra a TIMELINE e o VÍDEO separados. Antes exibia só o nome do clipe
+    // num botão chamado "selecionar sequência", o que fazia parecer que o
+    // usuário tinha selecionado um vídeo em vez da timeline.
+    const tl = info.timeline_name
+      ? `<div>Timeline: <b>${info.timeline_name}</b></div>`
+      : "";
+    $("tlInfo").innerHTML = tl +
+      `<div>Vídeo: <b>${info.name}</b> · ${Math.round(info.duration_sec)}s · ${info.fps?.toFixed?.(2) || "?"} fps</div>`;
     $("btnAnalyze").disabled = false;
   } catch (e) { msg($("tlInfo"), e.message, "err"); }
 };

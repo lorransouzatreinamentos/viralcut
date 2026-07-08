@@ -5,6 +5,7 @@ import math
 import os
 import tempfile
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -56,6 +57,17 @@ def _dv_log():
         }
         (_LOG_DIR / "last-run.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), "utf8")
     except Exception:  # noqa: BLE001 — log nunca derruba a operacao
+        pass
+
+
+def _dv_log_error(step: str, message: str):
+    """Registra falhas em disco. Sem isto, uma falha na maquina do usuario nao
+    deixa rastro nenhum -- e a depuracao remota fica as cegas."""
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with (_LOG_DIR / "errors.log").open("a", encoding="utf8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} | {step} | {message}\n")
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -376,6 +388,9 @@ async def dv_select():
     try:
         info = await asyncio.to_thread(davinci.get_source_media_path)
     except RuntimeError as e:
+        # grava a falha no log tambem -- antes so o sucesso era registrado, o que
+        # deixava a depuracao remota (maquina do usuario) as cegas
+        _dv_log_error("select", str(e))
         raise HTTPException(status_code=400, detail=str(e)) from e
     _dv.update({"source": info, "transcript": None, "viral": [], "montages": [], "silences": None})
     _dv_log()
@@ -515,7 +530,7 @@ async def dv_apply(req: DvApplyRequest):
 def _dv_apply_colored(cuts: list, colors: list, name: str) -> dict:
     """apply_source_cuts com uma cor por corte (para falas virais)."""
     import core.adapters.davinci as dv
-    mpi, fps, _p, _n, _d = dv._get_main_source()
+    mpi, fps, _p, _n, _d, _tl = dv._get_main_source()
     resolve = dv._bootstrap()
     project = dv._current_project(resolve)
     media_pool = project.GetMediaPool()

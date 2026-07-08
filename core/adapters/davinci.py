@@ -291,15 +291,45 @@ def _set_output_folder(media_pool, name: str):
         pass
 
 
+def list_timelines(project) -> list[str]:
+    """Nomes das timelines existentes no projeto (indice e 1-based na API)."""
+    names: list[str] = []
+    try:
+        for i in range(1, (project.GetTimelineCount() or 0) + 1):
+            tl = project.GetTimelineByIndex(i)
+            if tl:
+                names.append(tl.GetName())
+    except Exception:  # noqa: BLE001 — listagem e so para a mensagem de ajuda
+        pass
+    return names
+
+
 def _get_main_source():
     """Retorna (media_pool_item, fps, path, name, duration_sec) do clip de video
-    mais longo da timeline ativa. Reencontrado a cada chamada (nao cacheia objeto
-    do Resolve entre requisicoes HTTP)."""
+    mais longo da TIMELINE ABERTA. Reencontrado a cada chamada (nao cacheia objeto
+    do Resolve entre requisicoes HTTP).
+
+    Erro comum do usuario: selecionar um CLIPE no Media Pool em vez de abrir uma
+    timeline. O app trabalha sobre a timeline aberta na pagina Edit -- selecionar
+    um clipe nao a torna 'atual'. As mensagens abaixo dizem exatamente isso.
+    """
     resolve = _bootstrap()
     project = _current_project(resolve)
     timeline = project.GetCurrentTimeline()
     if timeline is None:
-        raise RuntimeError("Nenhuma timeline ativa. Abra uma timeline na pagina Edit.")
+        nomes = list_timelines(project)
+        if nomes:
+            lista = ", ".join(f'"{n}"' for n in nomes[:6])
+            raise RuntimeError(
+                "Nenhuma timeline ABERTA. Selecionar um clipe no Media Pool nao basta — "
+                "o VIRALCUT trabalha sobre a timeline aberta na pagina Edit. "
+                f"Timelines neste projeto: {lista}. "
+                "Va na pagina Edit e de dois cliques em uma delas, depois tente de novo."
+            )
+        raise RuntimeError(
+            "Este projeto nao tem nenhuma timeline. Arraste seu video para a "
+            "pagina Edit para criar uma timeline e tente de novo."
+        )
 
     best, best_dur = None, -1
     for t in range(1, timeline.GetTrackCount("video") + 1):
@@ -310,7 +340,10 @@ def _get_main_source():
             if dur > best_dur:
                 best_dur, best = dur, item
     if best is None:
-        raise RuntimeError("Nenhum clip de video com midia na timeline ativa.")
+        raise RuntimeError(
+            f'A timeline aberta ("{timeline.GetName()}") nao tem nenhum clipe de video. '
+            "Abra a timeline que contem o video que voce quer analisar."
+        )
 
     mpi = best.GetMediaPoolItem()
     props = mpi.GetClipProperty() or {}
@@ -327,13 +360,25 @@ def _get_main_source():
         frames = 0
     duration = frames / fps if frames and fps else 0.0
     name = props.get("Clip Name") or best.GetName() or "clip"
-    return mpi, fps, path, name, duration
+    try:
+        timeline_name = timeline.GetName()
+    except Exception:  # noqa: BLE001
+        timeline_name = ""
+    return mpi, fps, path, name, duration, timeline_name
 
 
 def get_source_media_path() -> dict:
-    """Metadados do arquivo-fonte (JSON-safe) para a UI. Nao modifica nada."""
-    _mpi, fps, path, name, duration = _get_main_source()
-    return {"path": path, "fps": fps, "name": name, "duration_sec": duration}
+    """Metadados do arquivo-fonte (JSON-safe) para a UI. Nao modifica nada.
+
+    Devolve o nome da TIMELINE e o do CLIPE separados: a UI mostrava so o nome do
+    clipe num botao chamado "selecionar sequencia", o que fazia o usuario pensar
+    que tinha selecionado um video em vez da timeline.
+    """
+    _mpi, fps, path, name, duration, timeline_name = _get_main_source()
+    return {
+        "path": path, "fps": fps, "name": name,
+        "duration_sec": duration, "timeline_name": timeline_name,
+    }
 
 
 def apply_source_cuts(cuts: list[dict], new_timeline_name: str, single_color: str | None = None) -> dict:
@@ -343,7 +388,7 @@ def apply_source_cuts(cuts: list[dict], new_timeline_name: str, single_color: st
     if not cuts:
         raise RuntimeError("Nenhum corte para aplicar.")
 
-    mpi, fps, _path, _name, _dur = _get_main_source()
+    mpi, fps, _path, _name, _dur, _tl = _get_main_source()
     resolve = _bootstrap()
     project = _current_project(resolve)
     media_pool = project.GetMediaPool()
