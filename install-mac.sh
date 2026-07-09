@@ -164,10 +164,17 @@ LAUNCHER
 chmod +x "$DEST/viralcut.command"
 ok "launcher criado: $DEST/viralcut.command"
 
-if ls -d /Applications/Adobe\ Premiere\ Pro* >/dev/null 2>&1; then
-  bash "$DEST/scripts/install-premiere.sh" >/dev/null && ok "painel do Premiere instalado"
+# Instala o painel SEMPRE (igual ao Windows). Copiar pra pasta de extensoes CEP
+# e inofensivo mesmo sem o Premiere -- assim, se o usuario instalar o Premiere
+# depois, o painel ja esta la (nao precisa rerodar o instalador).
+if bash "$DEST/scripts/install-premiere.sh" >/dev/null 2>&1; then
+  if ls -d /Applications/Adobe\ Premiere\ Pro* >/dev/null 2>&1; then
+    ok "painel do Premiere instalado"
+  else
+    ok "painel do Premiere preparado (Premiere ainda nao detectado — aparece quando instalar)"
+  fi
 else
-  skip "Premiere Pro nao encontrado — painel nao instalado"
+  warn "nao consegui instalar o painel do Premiere (segue funcionando pro DaVinci)"
 fi
 
 # --- Final --------------------------------------------------------------------

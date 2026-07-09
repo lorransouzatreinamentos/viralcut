@@ -35,10 +35,25 @@
     path.join(HOME, ".viralcut.env"),
     "/Applications/CLAUDE CODE/Projetos/VIRALCUT/.env" // legado (Mac do dono)
   ];
-  // Script compartilhado com o Core Python (mesma implementacao da engine local,
-  // ver o proprio arquivo). Fica em premiere-panel/host/ -- co-localizado com
-  // este arquivo (client/), sobrevive ao install (pasta inteira e copiada).
-  var LOCAL_TRANSCRIBE_SCRIPT = path.join(__dirname, "..", "host", "local_transcribe.py");
+  // Script compartilhado com o Core Python (mesma implementacao da engine local).
+  // ATENCAO: dentro do painel Adobe (CEP), __dirname NAO aponta de forma confiavel
+  // para client/ -- em algumas versoes ele resolve para a raiz da extensao, o que
+  // fazia o caminho virar .../extensions/host/ (sem o VIRALCUT/) e o app nao achar
+  // o script. Por isso procuramos em varios candidatos e usamos o 1o que existir.
+  // O primario e ~/viralcut/premiere-panel/host/ -- o instalador (install-mac.sh /
+  // install-windows.ps1) sempre clona o repo ali, mesmo caminho de onde o venv sai.
+  var LOCAL_TRANSCRIBE_CANDIDATES = [
+    path.join(HOME, "viralcut", "premiere-panel", "host", "local_transcribe.py"),
+    path.join(__dirname, "..", "host", "local_transcribe.py"), // se __dirname = client/
+    path.join(__dirname, "host", "local_transcribe.py"),        // se __dirname = raiz da extensao
+    "/Applications/CLAUDE CODE/Projetos/VIRALCUT/premiere-panel/host/local_transcribe.py" // legado (Mac do dono)
+  ];
+  function findLocalTranscribeScript() {
+    for (var i = 0; i < LOCAL_TRANSCRIBE_CANDIDATES.length; i++) {
+      try { if (fs.existsSync(LOCAL_TRANSCRIBE_CANDIDATES[i])) return LOCAL_TRANSCRIBE_CANDIDATES[i]; } catch (e) {}
+    }
+    return null;
+  }
 
   // ---------------------------------------------------------------------------
   // LOG — registra tudo (enviado, transcrito, retornado, plano, aplicado) em disco
@@ -183,14 +198,15 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   }
 
   async function transcribeLocal(audioPath, language) {
-    if (!fs.existsSync(LOCAL_TRANSCRIBE_SCRIPT)) {
-      throw new Error(INSTALL_HINT + "\n\n(script não encontrado: " + LOCAL_TRANSCRIBE_SCRIPT + ")");
+    var script = findLocalTranscribeScript();
+    if (!script) {
+      throw new Error(INSTALL_HINT + "\n\n(procurei em: " + LOCAL_TRANSCRIBE_CANDIDATES.join(" | ") + ")");
     }
     var candidates = pythonCandidates();
     for (var i = 0; i < candidates.length; i++) {
       var exe = candidates[i];
       if (path.isAbsolute(exe) && !fs.existsSync(exe)) continue;
-      var out = await runPython(exe, [LOCAL_TRANSCRIBE_SCRIPT, audioPath, language || "pt"]);
+      var out = await runPython(exe, [script, audioPath, language || "pt"]);
       if (!out) continue;
       var data;
       try { data = JSON.parse(out); } catch (e) { continue; }
