@@ -327,17 +327,23 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   var GRACE_UNDER = 0.5, GRACE_OVER = 1.5, ABS_FLOOR = 6, ABS_CEIL = 180;
 
   // Padding ADAPTATIVO de um trecho [w0..w1] (anti "come palavras"): o `end` do
-  // Whisper e o fim do fonema, nao do som audivel -- padding fixo pequeno decepa
-  // a ultima silaba. A cauda estende ate a proxima palavra (na linha do tempo),
-  // sem invadi-la. Usa as constantes HEAD_PAD_MAX/TAIL_PAD_MAX/TAIL_PAD_RATIO
-  // (definidas junto do padSpans dos silencios, mesma logica ja validada).
+  // Whisper e o fim do fonema, nao do som audivel -- por isso a cauda precisa ir
+  // ALEM do w1.end. Quando ha silencio ate a proxima palavra, estende ate ele
+  // (sem invadir). Quando a fala e CONTIGUA (proxima palavra logo em seguida), a
+  // folga e ~0 -- e ai um MINIMO garantido evita comer a silaba final (era o
+  // "cortado" que sobrava). O pequeno vazamento na proxima palavra e continuacao
+  // natural da fala, imperceptivel. Silencios (padSpans) NAO usam esse minimo.
+  var CLIP_HEAD_MIN = 0.05;  // respiro minimo antes
+  var CLIP_TAIL_MIN = 0.14;  // cauda minima -- garante a silaba final mesmo sem pausa
   function adaptivePad(w0, w1, wordsSorted, idxByStart) {
     var i0 = idxByStart[w0.id] != null ? idxByStart[w0.id] : 0;
     var i1 = idxByStart[w1.id] != null ? idxByStart[w1.id] : wordsSorted.length - 1;
     var prevEnd = i0 > 0 ? wordsSorted[i0 - 1].end : 0;
     var nextStart = (i1 + 1 < wordsSorted.length) ? wordsSorted[i1 + 1].start : (w1.end + TAIL_PAD_MAX);
-    var head = Math.min(HEAD_PAD_MAX, Math.max(0, w0.start - prevEnd) * 0.5);
-    var tail = Math.min(TAIL_PAD_MAX, Math.max(0, nextStart - w1.end) * TAIL_PAD_RATIO);
+    var headroom = Math.max(0, w0.start - prevEnd);
+    var tailroom = Math.max(0, nextStart - w1.end);
+    var head = Math.min(HEAD_PAD_MAX, Math.max(CLIP_HEAD_MIN, headroom * 0.5));
+    var tail = Math.min(TAIL_PAD_MAX, Math.max(CLIP_TAIL_MIN, tailroom * TAIL_PAD_RATIO));
     return { start: Math.max(0, w0.start - head), end: w1.end + tail };
   }
 
@@ -471,12 +477,42 @@ Cada bloco vem de um lugar distinto; juntos formam um raciocínio novo.
 3. PAYOFF: a virada ou frase-tapa que fecha e faz compartilhar.
 A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugares distantes.
 
-## COERÊNCIA (cada salto só vale se): continuidade lógica, ou temática, ou pergunta→resposta, ou contraste proposital. NUNCA deixe pronome órfão nem crie uma afirmação que a pessoa NÃO fez.
+## COERÊNCIA (A REGRA QUE MAIS IMPORTA): a sequência costurada TEM que soar como UMA fala contínua e natural, como se a pessoa tivesse dito tudo de uma vez. Leia a montagem inteira na sua cabeça: se soar picotada, se um bloco não conecta com o próximo, se um pronome fica órfão ("isso", "ele", "essa" sem referente), se o assunto pula sem lógica, ou se a costura cria uma afirmação que a pessoa NÃO fez → está ERRADA, não proponha. Cada salto só vale por continuidade lógica, temática, pergunta→resposta ou contraste proposital.
 
 ## HONESTIDADE: recombine a ORDEM, nunca distorça o que a pessoa disse. Só use texto que existe na transcrição.
 
-## TAMANHO: de 4 a 8 blocos, CADA UM de um momento diferente do vídeo.
-## Só entregue montagens genuinamente mais fortes que um corte linear (score acima de ~65). Ordene do maior score para o menor. Use a ferramenta propose_montages.`;
+## TAMANHO: de 4 a 8 blocos, cada um de um momento diferente do vídeo.
+## PREFIRA NÃO ENTREGAR A ENTREGAR RUIM: só proponha montagens genuinamente coerentes E com potencial viral/valor real (score acima de ~70). Se o vídeo não tem material que se recombine numa narrativa coerente e forte, entregue a LISTA VAZIA — é melhor não entregar nada do que entregar uma montagem sem sentido. Ordene do maior score para o menor. Use a ferramenta propose_montages.`;
+
+  var MIN_COERENCIA = 70;
+  var SYSTEM_PROMPT_CRITICA = `Você é um editor crítico rigoroso de cortes virais. Recebe MONTAGENS — cada uma é uma sequência de falas costuradas de momentos diferentes de um vídeo, na ordem em que seriam reproduzidas. Julgue, com HONESTIDADE BRUTAL, se cada montagem funciona.
+
+Para CADA montagem, leia os blocos NA ORDEM dada, como se fosse uma fala única:
+- COERENTE? Soa como uma pessoa falando de forma contínua e natural? Ou soa picotado, com saltos que não conectam, pronome órfão, assunto que muda sem lógica, ou uma afirmação que a costura inventou?
+- FORTE? Tem gancho, entrega valor ou emoção, e tem chance real de viralizar/prender atenção? Ou é morno e genérico?
+
+Devolva para cada uma: index, coerente (bool), nota (0-100 de coerência+força), motivo (1 frase).
+Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" do que entregar uma montagem sem sentido. Use a ferramenta avaliar_montagens.`;
+
+  var CRITICA_SCHEMA = {
+    type: "object",
+    properties: {
+      avaliacoes: {
+        type: "array",
+        items: {
+          type: "object", additionalProperties: false,
+          properties: {
+            index: { type: "integer" },
+            coerente: { type: "boolean" },
+            nota: { type: "integer" },
+            motivo: { type: "string" }
+          },
+          required: ["index", "coerente", "nota"]
+        }
+      }
+    },
+    required: ["avaliacoes"]
+  };
 
   var MONTAGE_SCHEMA = {
     type: "object",
@@ -820,7 +856,30 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
       var m = resolveMontage(raw[i], transcript, i, wordsSorted, idxByStart);
       if (m) { montages.push(m); keptSegments.push(segs); }
     }
-    montages.sort(function (a, b) { return b.score - a.score; });
+
+    // CRITICA de coerencia (2o modelo, frio): le o texto costurado e reprova as
+    // incoerentes. Garante o pedido do usuario: nao entregar montagem sem sentido.
+    var reprovadas = 0;
+    if (montages.length) {
+      try {
+        var critica = await gptCall(apiKey, SYSTEM_PROMPT_CRITICA,
+          "Avalie cada montagem (blocos separados por //):\n\n" +
+          montages.map(function (mm, ix) { return "[montagem " + ix + "] " + mm.text; }).join("\n\n"),
+          "avaliar_montagens", CRITICA_SCHEMA, null, 0.15);
+        var verdicts = {};
+        (critica.avaliacoes || []).forEach(function (a) { if (typeof a.index === "number") verdicts[a.index] = a; });
+        var aprovadas = [];
+        for (var vi = 0; vi < montages.length; vi++) {
+          var v = verdicts[vi];
+          if (v == null) { aprovadas.push(montages[vi]); continue; }  // sem veredito: conservador, mantem
+          if (v.coerente && (v.nota || 0) >= MIN_COERENCIA) { montages[vi].coerencia = v.nota; aprovadas.push(montages[vi]); }
+          else reprovadas++;
+        }
+        montages = aprovadas;
+      } catch (e) { /* critica falhou: entrega o que passou nos filtros locais */ }
+    }
+
+    montages.sort(function (a, b) { return (b.coerencia || b.score) - (a.coerencia || a.score); });
     var valid = montages.length;
     montages = montages.slice(0, nVideos);              // respeita a quantidade pedida
     // cada montagem inteira ganha 1 cor propria (usada na timeline e no preview)
@@ -830,10 +889,11 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
     }
     var meta = {
       requested: nVideos, suggested: raw.length, valid: valid,
-      delivered: montages.length, descartadas_agrupadas: descartadasAgrupadas
+      delivered: montages.length, descartadas_agrupadas: descartadasAgrupadas,
+      reprovadas_incoerentes: reprovadas, insufficient: montages.length === 0
     };
-    sink.resolved = montages.map(function (m) { return { titulo: m.titulo, score: m.score, pieces: m.pieces.length, cor: m.color_name, text: m.text }; });
-    sink.summary = montages.length + "/" + nVideos + " montagens (sugeridas " + raw.length + ", validas " + valid + ")";
+    sink.resolved = montages.map(function (m) { return { titulo: m.titulo, score: m.score, coerencia: m.coerencia, pieces: m.pieces.length, cor: m.color_name, text: m.text }; });
+    sink.summary = montages.length + "/" + nVideos + " montagens (sugeridas " + raw.length + ", reprovadas " + reprovadas + ")";
     logObjective(sink);
     return { montages: montages, meta: meta };
   }

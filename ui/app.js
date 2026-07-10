@@ -205,7 +205,17 @@ function renderClips(clips, rejected, o) {
 }
 
 function renderMontages(montages, o, meta) {
-  if (!montages.length) return msg($("results"), "Nenhuma montagem gerada. Tente ampliar a faixa de duração.", "err");
+  if (!montages.length) {
+    // Pedido do usuário: quando não dá pra montar algo coerente/forte, dizer isso
+    // explicitamente em vez de entregar lixo ou uma mensagem genérica.
+    const motivo = meta && meta.reprovadas_incoerentes
+      ? "As combinações possíveis não ficaram coerentes o suficiente para virar um vídeo bom."
+      : "O conteúdo deste vídeo não se recombina numa narrativa nova e forte.";
+    return msg($("results"),
+      `<b>Não teve material suficiente para criar.</b><br>${motivo}<br>` +
+      `<span style="opacity:.75">Tente um vídeo com mais assuntos/ganchos distintos, ou use "Falas virais" para extrair os melhores trechos inteiros.</span>`,
+      "err");
+  }
   const pedido = (meta && meta.requested) ?? (o && o.nVideos);
   // Transparência: mostra o funil (pedidas → sugeridas pela IA → válidas →
   // entregues) em vez de só entregar menos que o pedido em silêncio.

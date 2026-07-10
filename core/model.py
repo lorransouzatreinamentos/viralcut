@@ -124,13 +124,16 @@ class HighlightClip(BaseModel):
         return self
 
 
-# Padding ADAPTATIVO (mesma logica dos silencios em objectives.py e do adaptivePad
-# no core-cep.js). O `end` do Whisper e o fim do fonema, nao do som audivel; um
-# padding fixo pequeno decepa a ultima silaba (o "come palavras"). A cauda estende
-# ate a proxima palavra falada, sem invadi-la.
+# Padding ADAPTATIVO (espelha o adaptivePad no core-cep.js). O `end` do Whisper e
+# o fim do fonema, nao do som audivel; a cauda precisa ir ALEM do fim da palavra.
+# Quando ha silencio ate a proxima palavra, estende ate ele. Quando a fala e
+# CONTIGUA (folga ~0), um MINIMO garantido evita comer a silaba final -- era o
+# "cortado" que sobrava em cortes de fala continua.
 _HEAD_PAD_MAX = 0.10
 _TAIL_PAD_MAX = 0.25
 _TAIL_PAD_RATIO = 0.8
+_HEAD_PAD_MIN = 0.05
+_TAIL_PAD_MIN = 0.14
 
 
 def resolve_highlight(
@@ -159,12 +162,14 @@ def resolve_highlight(
     start_word = transcript.word_by_id(start_word_id)
     end_word = transcript.word_by_id(end_word_id)
 
-    # padding adaptativo: usa a folga real ate a palavra vizinha (nunca invade)
+    # padding adaptativo com MINIMO garantido (ver constantes acima)
     prev_end = max((w.end for w in transcript.words if w.end <= start_word.start), default=0.0)
     next_start = min((w.start for w in transcript.words if w.start >= end_word.end),
                      default=end_word.end + _TAIL_PAD_MAX)
-    head = min(_HEAD_PAD_MAX, max(0.0, start_word.start - prev_end) * 0.5)
-    tail = min(_TAIL_PAD_MAX, max(0.0, next_start - end_word.end) * _TAIL_PAD_RATIO)
+    headroom = max(0.0, start_word.start - prev_end)
+    tailroom = max(0.0, next_start - end_word.end)
+    head = min(_HEAD_PAD_MAX, max(_HEAD_PAD_MIN, headroom * 0.5))
+    tail = min(_TAIL_PAD_MAX, max(_TAIL_PAD_MIN, tailroom * _TAIL_PAD_RATIO))
     start = max(0.0, start_word.start - head)
     end = end_word.end + tail
 

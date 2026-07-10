@@ -36,10 +36,47 @@ ARCO (puxando de QUALQUER ponto do video):
 3. PAYOFF: a virada ou frase-tapa que fecha e faz compartilhar.
 A montagem soa como UMA fala continua e proposital, MAS as pecas vem de lugares distantes.
 
-COERENCIA: cada salto so vale se houver continuidade logica, tematica, pergunta->resposta, ou contraste proposital. NUNCA deixe pronome orfao nem crie uma afirmacao que a pessoa NAO fez.
+COERENCIA (A REGRA QUE MAIS IMPORTA): a sequencia de falas costuradas TEM que soar como UMA fala continua e natural, como se a pessoa tivesse dito tudo aquilo de uma vez. Leia a montagem inteira em voz alta na sua cabeca: se soar picotada, se um bloco nao conecta com o proximo, se um pronome fica orfao ("isso", "ele", "essa" sem referente), se o assunto pula sem logica, ou se a costura cria uma afirmacao que a pessoa NAO fez -> a montagem esta ERRADA, nao proponha. Cada salto so vale por continuidade logica, tematica, pergunta->resposta ou contraste proposital.
 HONESTIDADE: recombine a ORDEM, nunca distorca o que a pessoa disse. Use apenas texto que existe na transcricao.
-TAMANHO: de 4 a 8 blocos, CADA UM de um momento diferente do video.
-So entregue montagens genuinamente mais fortes que um corte linear (score acima de ~65). Ordene do maior score para o menor. Use a ferramenta propose_montages."""
+TAMANHO: de 4 a 8 blocos, cada um de um momento diferente do video.
+PREFIRA NAO ENTREGAR A ENTREGAR RUIM: so proponha montagens genuinamente coerentes E com potencial viral/valor real (score acima de ~70). Se o video nao tem material que se recombine numa narrativa coerente e forte, entregue a LISTA VAZIA -- e melhor nao entregar nada do que entregar uma montagem sem sentido. Ordene do maior score para o menor. Use a ferramenta propose_montages."""
+
+
+# Passo de CRITICA: apos gerar, um segundo modelo (frio) le o TEXTO costurado de
+# cada montagem e julga com honestidade brutal se soa como uma fala continua e
+# coerente. So passa quem for coerente E forte. Se nada passa -> "sem material".
+# E o que garante o pedido do usuario: nao entregar montagem incoerente.
+MIN_COERENCIA = 70
+
+SYSTEM_PROMPT_CRITICA = """Voce e um editor critico rigoroso de cortes virais. Recebe MONTAGENS -- cada uma e uma sequencia de falas costuradas de momentos diferentes de um video, na ordem em que seriam reproduzidas. Seu trabalho e julgar, com HONESTIDADE BRUTAL, se cada montagem funciona.
+
+Para CADA montagem, avalie lendo os blocos NA ORDEM dada, como se fosse uma fala unica:
+- COERENTE? Soa como uma pessoa falando de forma continua e natural? Ou soa picotado, com saltos que nao conectam, pronome orfao, assunto que muda sem logica, ou uma afirmacao que a costura inventou?
+- FORTE? Tem gancho, entrega valor ou emocao, e tem chance real de viralizar/prender atencao? Ou e morno e generico?
+
+Devolva para cada uma: coerente (bool), nota (0-100 de coerencia+forca combinadas), motivo (1 frase).
+Seja rigoroso: na duvida, REPROVE. E melhor a ferramenta dizer "sem material" do que entregar uma montagem sem sentido. Use a ferramenta avaliar_montagens."""
+
+CRITICA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "avaliacoes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "index": {"type": "integer"},
+                    "coerente": {"type": "boolean"},
+                    "nota": {"type": "integer"},
+                    "motivo": {"type": "string"},
+                },
+                "required": ["index", "coerente", "nota"],
+            },
+        }
+    },
+    "required": ["avaliacoes"],
+}
 
 MONTAGE_SCHEMA = {
     "type": "object",
@@ -152,15 +189,20 @@ def _has_segment(transcript: TranscriptState, seg_id: int) -> bool:
         return False
 
 
+# Cauda/cabeca MINIMAS para trechos de corte/montagem (nao para silencios): numa
+# fala CONTIGUA a folga e ~0 e o padding adaptativo puro deixava a cauda em ~0,
+# comendo a silaba final (o "cortado"). Estes minimos garantem o som completo.
+CLIP_HEAD_MIN = 0.05
+CLIP_TAIL_MIN = 0.14
+
+
 def _piece_span(seg, transcript, words_sorted: list, idx_by_start: dict) -> dict:
-    """Timecode de um trecho da montagem com padding ADAPTATIVO (mesma logica dos
-    silencios): o `end` do Whisper e o fim do fonema, nao do som audivel. Um
-    padding fixo pequeno decepa a ultima silaba -- e o 'come palavras' da montagem.
-    A cauda estende ate a proxima palavra falada, sem invadi-la."""
+    """Timecode de um trecho da montagem com padding ADAPTATIVO + minimo garantido
+    (espelha adaptivePad no core-cep.js). O `end` do Whisper e o fim do fonema; a
+    cauda vai alem, ate a proxima palavra, e nunca menos que CLIP_TAIL_MIN."""
     w0 = transcript.word_by_id(seg.word_ids[0])
     w1 = transcript.word_by_id(seg.word_ids[-1])
 
-    # palavra anterior a w0 e posterior a w1 na linha do tempo (para nao invadir)
     i0 = idx_by_start.get(w0.id, 0)
     i1 = idx_by_start.get(w1.id, len(words_sorted) - 1)
     prev_end = words_sorted[i0 - 1].end if i0 > 0 else 0.0
@@ -168,8 +210,8 @@ def _piece_span(seg, transcript, words_sorted: list, idx_by_start: dict) -> dict
 
     headroom = max(0.0, w0.start - prev_end)
     tailroom = max(0.0, next_start - w1.end)
-    head = min(HEAD_PAD_MAX, headroom * 0.5)
-    tail = min(TAIL_PAD_MAX, tailroom * TAIL_PAD_RATIO)
+    head = min(HEAD_PAD_MAX, max(CLIP_HEAD_MIN, headroom * 0.5))
+    tail = min(TAIL_PAD_MAX, max(CLIP_TAIL_MIN, tailroom * TAIL_PAD_RATIO))
     return {"start": max(0.0, w0.start - head), "end": w1.end + tail, "text": seg.text}
 
 
@@ -235,18 +277,81 @@ MONTAGE_REQUEST_BUFFER = 2
 MONTAGE_REQUEST_CAP = 10
 
 
+async def _call_openai_critique(montages: list[dict]) -> dict:
+    """Segundo modelo (frio) le o texto costurado e julga coerencia+forca."""
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY nao configurada")
+    model = settings.llm_model if settings.llm_provider == "openai" else "gpt-4o"
+    linhas = [f"[montagem {i}] {m['text']}" for i, m in enumerate(montages)]
+    user = "Avalie cada montagem (blocos separados por //):\n\n" + "\n\n".join(linhas)
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            OPENAI_URL,
+            headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "temperature": 0.15,  # critica e julgamento -> frio e consistente
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT_CRITICA},
+                    {"role": "user", "content": user},
+                ],
+                "tools": [{"type": "function", "function": {
+                    "name": "avaliar_montagens", "parameters": CRITICA_SCHEMA}}],
+                "tool_choice": {"type": "function", "function": {"name": "avaliar_montagens"}},
+            },
+        )
+    resp.raise_for_status()
+    calls = resp.json()["choices"][0]["message"].get("tool_calls")
+    if not calls:
+        return {"avaliacoes": []}
+    return json.loads(calls[0]["function"]["arguments"])
+
+
+def _apply_critique(montages: list[dict], critica: dict) -> tuple[list[dict], int]:
+    """Mantem so as montagens aprovadas (coerente E nota>=MIN). Guarda a nota de
+    coerencia em cada uma. Retorna (aprovadas, reprovadas_por_incoerencia)."""
+    verdicts = {a["index"]: a for a in critica.get("avaliacoes", []) if isinstance(a.get("index"), int)}
+    aprovadas, reprovadas = [], 0
+    for i, m in enumerate(montages):
+        v = verdicts.get(i)
+        # sem veredito para esta montagem -> conservador: mantem (nao inventa reprovacao)
+        if v is None:
+            aprovadas.append(m)
+            continue
+        if v.get("coerente") and int(v.get("nota", 0)) >= MIN_COERENCIA:
+            m["coerencia"] = int(v.get("nota", 0))
+            aprovadas.append(m)
+        else:
+            reprovadas += 1
+    return aprovadas, reprovadas
+
+
 async def extract_montages(
     transcript: TranscriptState, max_montages: int = 3, min_dur: float = 15, max_dur: float = 90,
 ) -> tuple[list[dict], dict]:
-    """Retorna (montagens_entregues, meta). meta expoe QUANTO foi pedido vs
-    sugerido vs valido vs entregue -- para a UI explicar por que veio menos que
-    o pedido, em vez de simplesmente entregar menos em silencio."""
+    """Retorna (montagens_entregues, meta). Fluxo: gera candidatas -> filtra
+    espalhamento/dedup -> CRITICA de coerencia (2o modelo) -> so entrega as
+    aprovadas. Se nenhuma sobrevive, meta['insufficient']=True e a UI mostra
+    "Nao teve material suficiente para criar". meta tambem expoe o funil
+    (pedido/sugerido/valido/entregue) para transparencia."""
+    empty_meta = {"requested": max_montages, "suggested": 0, "valid": 0, "delivered": 0,
+                  "descartadas_agrupadas": 0, "reprovadas_incoerentes": 0, "insufficient": True}
     if not transcript.segments:
-        return [], {"requested": max_montages, "suggested": 0, "valid": 0, "delivered": 0, "descartadas_agrupadas": 0}
+        return [], empty_meta
 
     request_count = min(max_montages + MONTAGE_REQUEST_BUFFER, MONTAGE_REQUEST_CAP)
     raw = await _call_openai_montage(transcript, request_count, min_dur, max_dur)
     montages, descartadas_agrupadas = _resolve_montages(raw, transcript)
+
+    reprovadas = 0
+    if montages:
+        try:
+            critica = await _call_openai_critique(montages)
+            montages, reprovadas = _apply_critique(montages, critica)
+            montages.sort(key=lambda x: x.get("coerencia", x["score"]), reverse=True)
+        except Exception:  # noqa: BLE001 -- se a critica falhar, nao derruba; entrega o que passou nos filtros locais
+            pass
+
     delivered = montages[:max_montages]
     meta = {
         "requested": max_montages,
@@ -254,6 +359,8 @@ async def extract_montages(
         "valid": len(montages),
         "delivered": len(delivered),
         "descartadas_agrupadas": descartadas_agrupadas,
+        "reprovadas_incoerentes": reprovadas,
+        "insufficient": len(delivered) == 0,
     }
     return delivered, meta
 

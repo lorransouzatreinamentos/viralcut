@@ -140,10 +140,19 @@ def test_pede_folga_a_mais_do_que_o_solicitado(monkeypatch):
     assert pedidos["request_count"] == 3 + MONTAGE_REQUEST_BUFFER
 
 
+def _approve_all_critique(monkeypatch):
+    """Mock da critica que aprova tudo (para testar a logica LOCAL de folga/dedup
+    sem depender da API real)."""
+    async def fake_critica(montages):
+        return {"avaliacoes": [{"index": i, "coerente": True, "nota": 90} for i in range(len(montages))]}
+    monkeypatch.setattr("core.objectives._call_openai_critique", fake_critica)
+
+
 def test_pedido_3_com_2_rejeitadas_ainda_entrega_3_gracas_a_folga(monkeypatch):
     """Reproduz o relato do usuario, mas com a folga: a IA propoe 5 (3 pedidas +
     2 de folga), 2 ficam agrupadas e sao descartadas, mas ainda sobram 3 boas."""
     t = _transcript(n=20)
+    _approve_all_critique(monkeypatch)
 
     async def fake_call(_t, request_count, _min, _max):
         assert request_count == 5  # 3 + buffer(2)
@@ -159,13 +168,15 @@ def test_pedido_3_com_2_rejeitadas_ainda_entrega_3_gracas_a_folga(monkeypatch):
     montages, meta = asyncio.run(extract_montages(t, max_montages=3))
 
     assert len(montages) == 3, "mesmo com 2 rejeitadas, a folga deveria manter as 3 pedidas"
-    assert meta == {"requested": 3, "suggested": 5, "valid": 3, "delivered": 3, "descartadas_agrupadas": 2}
+    assert meta["delivered"] == 3 and meta["suggested"] == 5 and meta["descartadas_agrupadas"] == 2
+    assert meta["insufficient"] is False
 
 
 def test_meta_mostra_quando_entrega_menos_que_o_pedido(monkeypatch):
     """Se mesmo com folga a IA nao acha material espalhado o bastante, o app
     tem que EXPLICAR (via meta), nao so entregar menos em silencio."""
     t = _transcript(n=20)
+    _approve_all_critique(monkeypatch)
 
     async def fake_call(_t, _req, _min, _max):
         return {"montagens": [{"segments": [1, 2, 3], "titulo": "so uma agrupada", "score": 90}]}
@@ -177,3 +188,71 @@ def test_meta_mostra_quando_entrega_menos_que_o_pedido(monkeypatch):
     assert meta["requested"] == 3
     assert meta["suggested"] == 1
     assert meta["descartadas_agrupadas"] == 1
+    assert meta["insufficient"] is True
+
+
+# --- Fix B: critica de coerencia + fallback "sem material" -------------------
+
+def test_critica_reprova_incoerente_e_marca_sem_material(monkeypatch):
+    """O pedido do usuario: montagem que nao e coerente/forte NAO e entregue;
+    se nenhuma passa, insufficient=True (UI mostra 'sem material')."""
+    t = _transcript(n=20)
+
+    async def fake_call(_t, _req, _min, _max):
+        return {"montagens": [
+            {"segments": [0, 8, 15], "titulo": "espalhada mas incoerente", "score": 90},
+            {"segments": [1, 9, 16], "titulo": "outra incoerente", "score": 85},
+        ]}
+    async def fake_critica(montages):
+        # a critica reprova as duas (incoerentes)
+        return {"avaliacoes": [{"index": i, "coerente": False, "nota": 40} for i in range(len(montages))]}
+
+    monkeypatch.setattr("core.objectives._call_openai_montage", fake_call)
+    monkeypatch.setattr("core.objectives._call_openai_critique", fake_critica)
+    montages, meta = asyncio.run(extract_montages(t, max_montages=3))
+
+    assert montages == [], "montagens incoerentes nao podem ser entregues"
+    assert meta["insufficient"] is True
+    assert meta["reprovadas_incoerentes"] == 2
+
+
+def test_critica_aprova_coerente_e_reprova_a_fraca(monkeypatch):
+    """Mistura: 1 coerente forte passa, 1 com nota abaixo do minimo cai."""
+    t = _transcript(n=20)
+
+    async def fake_call(_t, _req, _min, _max):
+        return {"montagens": [
+            {"segments": [0, 8, 15], "titulo": "boa", "score": 90},
+            {"segments": [1, 9, 16], "titulo": "fraca", "score": 85},
+        ]}
+    async def fake_critica(montages):
+        return {"avaliacoes": [
+            {"index": 0, "coerente": True, "nota": 82},   # passa
+            {"index": 1, "coerente": True, "nota": 55},   # nota < MIN_COERENCIA -> cai
+        ]}
+
+    monkeypatch.setattr("core.objectives._call_openai_montage", fake_call)
+    monkeypatch.setattr("core.objectives._call_openai_critique", fake_critica)
+    montages, meta = asyncio.run(extract_montages(t, max_montages=3))
+
+    assert [m["titulo"] for m in montages] == ["boa"]
+    assert montages[0]["coerencia"] == 82
+    assert meta["insufficient"] is False
+
+
+def test_critica_falha_nao_derruba_entrega_o_que_passou(monkeypatch):
+    """Se a chamada de critica falhar (rede/API), nao perde tudo -- entrega o que
+    passou nos filtros locais (degradacao graciosa)."""
+    t = _transcript(n=20)
+
+    async def fake_call(_t, _req, _min, _max):
+        return {"montagens": [{"segments": [0, 8, 15], "titulo": "boa", "score": 90}]}
+    async def fake_critica(_montages):
+        raise RuntimeError("api caiu")
+
+    monkeypatch.setattr("core.objectives._call_openai_montage", fake_call)
+    monkeypatch.setattr("core.objectives._call_openai_critique", fake_critica)
+    montages, meta = asyncio.run(extract_montages(t, max_montages=3))
+
+    assert [m["titulo"] for m in montages] == ["boa"]
+    assert meta["insufficient"] is False
