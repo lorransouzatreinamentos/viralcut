@@ -42,7 +42,7 @@ def _build_user_prompt(
     transcript: TranscriptState, min_score: int, max_clips: int, min_dur: float, max_dur: float
 ) -> str:
     lines = [f"[seg {s.id} | {s.start:.2f}-{s.end:.2f}] {s.text}" for s in transcript.segments]
-    return f"""DURACAO ALVO DOS CORTES: {min_dur:.0f}-{max_dur:.0f} segundos
+    return f"""DURACAO ALVO DOS CORTES: {min_dur:.0f}-{max_dur:.0f} segundos (ALVO, nao regra rigida)
 N. MAXIMO DE CORTES: {max_clips}
 SCORE MINIMO: {min_score}
 
@@ -50,10 +50,15 @@ TRANSCRICAO (cada linha = um segmento com id, tempo e texto):
 {chr(10).join(lines)}
 
 TAREFA:
-Selecione os melhores trechos para cortes virais. Para cada corte, avalie:
+Selecione os melhores trechos para cortes virais. Cada corte e UMA fala CONTINUA e
+COMPLETA (do start_seg_id ao end_seg_id, sem pulos internos). Avalie:
 - HOOK: os primeiros ~3s prendem a atencao e conectam ao tema?
 - FLOW: o corte tem narrativa completa (comeco-meio-fim) e se entende sem contexto externo?
 - EMOCAO/CONTRAINTUICAO: ha pico emocional, tensao ou quebra de expectativa?
+
+REGRA DE DURACAO: a faixa e um ALVO. NUNCA corte no meio de um raciocinio so para
+caber. Completar a ideia vale MAIS que a duracao exata -- pode ficar um pouco abaixo
+ou acima da faixa se for o necessario para a fala fazer sentido inteira.
 
 Cada corte deve comecar e terminar em fronteiras de segmento (use os IDs).
 Ordene por potencial viral (score 0-100). NAO inclua cortes com score < {min_score}."""
@@ -66,17 +71,29 @@ def _extract_tool_use_input(data: dict) -> dict:
     return tool_use["input"]
 
 
+# A faixa min/max e um ALVO, nao regra rigida. Uma fala completa que fica um pouco
+# fora nao pode ser descartada (pedido do usuario: "pode ser mais ou menos do que o
+# tempo definido se for preciso"). So descartamos fragmentos/arrastados absurdos.
+GRACE_UNDER = 0.5   # aceita ate 50% abaixo do min (fala completa curta sobrevive)
+GRACE_OVER = 1.5    # aceita ate 50% acima do max
+ABS_FLOOR = 6.0     # abaixo disso nao e corte, e fragmento
+ABS_CEIL = 180.0    # acima disso nao e "corte curto"
+
+
 def _resolve_and_filter(
     raw_input: dict, transcript: TranscriptState, min_score: int, max_clips: int,
     min_dur: float = 0.0, max_dur: float = 0.0,
 ) -> tuple[list[HighlightClip], dict]:
-    """Enforcement de duracao em CODIGO, nao so no prompt -- a IA nao respeita a
-    faixa de forma confiavel, e era isso que gerava 'corte de 15s sem sentido'.
-    Retorna (clips, rejeitados)."""
+    """Filtra por score e por duracao -- mas a duracao e ALVO com folga, nao corte
+    seco: uma fala completa perto da borda da faixa e mantida (o que importa e a
+    ideia inteira, nao o cronometro). Retorna (clips, rejeitados)."""
     try:
         batch = LLMHighlightBatch.model_validate(raw_input)
     except ValidationError as e:
         raise RuntimeError(f"IA devolveu formato invalido: {e}") from e
+
+    lo = max(ABS_FLOOR, min_dur * GRACE_UNDER) if min_dur else 0.0
+    hi = min(ABS_CEIL, max_dur * GRACE_OVER) if max_dur else float("inf")
 
     clips: list[HighlightClip] = []
     rejected = {"curto": 0, "longo": 0}
@@ -89,10 +106,10 @@ def _resolve_and_filter(
         if clip.score < min_score:
             continue
         dur = clip.end - clip.start
-        if min_dur and dur < min_dur:
+        if dur < lo:
             rejected["curto"] += 1
             continue
-        if max_dur and dur > max_dur:
+        if dur > hi:
             rejected["longo"] += 1
             continue
         clips.append(clip)

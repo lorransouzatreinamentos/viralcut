@@ -99,7 +99,7 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
 
 ## SCORE — AUMENTAM: hook forte (maior peso), autossuficiência (entende sem o resto do vídeo, sem pronome órfão), gatilho emocional, contra-intuição, especificidade (números/exemplos/história), identificação, motivo de compartilhamento, payoff satisfatório. REDUZEM: trecho morno, contexto-dependente, arrastado, sem conclusão, genérico, abertura fraca.
 
-## DURAÇÃO — REGRA RÍGIDA: a faixa de duração vem no pedido do usuário e é OBRIGATÓRIA. Um corte fora dessa faixa é DESCARTADO automaticamente pelo sistema, então nem proponha. Se um trecho bom é curto demais, ESTENDA-O incluindo os segmentos vizinhos que completam o raciocínio (o contexto que leva à frase, ou a conclusão que vem depois) até entrar na faixa. Se não houver como estender mantendo sentido, não proponha esse corte. Dentro da faixa, priorize completude narrativa.
+## DURAÇÃO — ALVO, NÃO REGRA RÍGIDA: a faixa é um ALVO. Cada corte é UMA fala CONTÍNUA e COMPLETA (do start_seg_id ao end_seg_id, sem pulos internos). NUNCA corte no meio de um raciocínio só para caber na faixa — completar a ideia vale MAIS que a duração exata. O corte pode ficar um pouco ABAIXO ou ACIMA da faixa se for o necessário para a fala fazer sentido inteira. Se um trecho é curto, você PODE estendê-lo com os segmentos vizinhos que completam o raciocínio, mas sem inflar com enrolação. Priorize sempre completude narrativa sobre o cronômetro.
 
 ## FRONTEIRAS: comece no segmento que contém o GANCHO (corte o aquecimento anterior); termine no segmento que fecha a ideia (conclusão/respiro/frase de efeito). start_seg_id < end_seg_id. Nunca termine em conjunção ("porque...", "e aí...", "mas...").
 
@@ -303,12 +303,16 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   var PADDING = 0.08;
   var COLOR_CYCLE = [9, 8, 7, 13, 6, 10, 4, 5]; // indices de label do Premiere
 
-  // ENFORCEMENT de duracao em CODIGO, nao so no prompt. A IA ignora instrucoes
-  // de duracao com frequencia -- entao o corte que sai da faixa e descartado
-  // aqui, na resolucao. E isso que impede "corte de 15s sem sentido".
+  // Faixa min/max e ALVO com folga, nao corte seco: uma fala COMPLETA perto da
+  // borda e mantida (o usuario pediu "pode ser mais ou menos se for preciso").
+  // So descartamos fragmentos/arrastados absurdos.
+  var GRACE_UNDER = 0.5, GRACE_OVER = 1.5, ABS_FLOOR = 6, ABS_CEIL = 180;
+
   function resolveClips(raw, transcript, minDur, maxDur) {
     var out = [];
     var rejected = { curto: 0, longo: 0 };
+    var lo = minDur ? Math.max(ABS_FLOOR, minDur * GRACE_UNDER) : 0;
+    var hi = maxDur ? Math.min(ABS_CEIL, maxDur * GRACE_OVER) : Infinity;
     for (var i = 0; i < raw.length; i++) {
       var r = raw[i];
       var sSeg = segById(transcript, r.start_seg_id);
@@ -327,8 +331,8 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
       if (end <= start) continue;
 
       var dur = end - start;
-      if (minDur && dur < minDur) { rejected.curto++; continue; }
-      if (maxDur && dur > maxDur) { rejected.longo++; continue; }
+      if (dur < lo) { rejected.curto++; continue; }
+      if (dur > hi) { rejected.longo++; continue; }
 
       // texto para exibir: usa o texto dos SEGMENTOS (completo), nao a
       // reconstrucao a partir das palavras (o array de words do Whisper as vezes
@@ -409,24 +413,29 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   // ===========================================================================
   // OBJETIVO 2 — MONTAR FALAS (frankenbite): costura trechos de varios momentos
   // ===========================================================================
-  var SYSTEM_PROMPT_MONTAGE = `Você é um editor sênior e montador narrativo de cortes virais. Sua especialidade é o FRANKENBITE: costurar falas de MOMENTOS DIFERENTES de um mesmo vídeo em português para construir uma narrativa nova, mais forte e mais viral do que qualquer trecho linear.
+  var SYSTEM_PROMPT_MONTAGE = `Você é um editor sênior e montador narrativo. Sua especialidade é o FRANKENBITE: costurar falas de MOMENTOS BEM DISTANTES de um mesmo vídeo em português para construir uma NARRATIVA NOVA, mais forte que qualquer trecho linear.
 
 ## ENTRADA: transcrição SEGMENTADA (id, tempo, texto).
 ## SAÍDA: para cada montagem, SOMENTE: segments (LISTA ORDENADA de ids na ordem de reprodução — NÃO cronológica), titulo, hook_first_3s, motivo, score (0-100). NUNCA escreva timestamps, apenas ids.
 
-## ARCO OBRIGATÓRIO (puxando de qualquer ponto do vídeo):
+## REGRA MAIS IMPORTANTE — ESPALHAMENTO:
+Os segmentos de UMA montagem TÊM que vir de partes BEM DIFERENTES do vídeo (começo, meio E fim), nunca de um mesmo trecho. Pegar segmentos vizinhos/seguidos (ex: 12,13,14,15) NÃO é montagem — é só um corte linear, e está ERRADO. O certo é SALTAR pelo vídeo inteiro.
+EXEMPLO DE BOA MONTAGEM (repare como os ids/tempos pulam por todo o vídeo):
+  seg do minuto 0  →  seg do minuto 2  →  seg do minuto 0 de novo  →  seg do minuto 3  →  seg do minuto 1
+Cada bloco vem de um lugar distinto; juntos formam um raciocínio novo.
+
+## ARCO (puxando de QUALQUER ponto do vídeo):
 1. GANCHO CONTRA-INTUITIVO: a afirmação mais forte/surpreendente do vídeo, mesmo que dita no meio ou no fim — comece pelo pico.
-2. DESENVOLVIMENTO: os blocos que sustentam/explicam o gancho, na ordem que constrói melhor o argumento.
+2. DESENVOLVIMENTO: blocos de OUTROS momentos que sustentam/explicam o gancho.
 3. PAYOFF: a virada ou frase-tapa que fecha e faz compartilhar.
-A montagem tem que soar como UMA fala contínua e proposital.
+A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugares distantes.
 
-## COERÊNCIA (cada salto entre segmentos só vale se): continuidade lógica, ou temática, ou pergunta→resposta, ou contraste proposital que faz sentido. NUNCA junte blocos onde um pronome fica órfão, o assunto muda de forma confusa, ou a costura cria uma afirmação que a pessoa NÃO fez.
+## COERÊNCIA (cada salto só vale se): continuidade lógica, ou temática, ou pergunta→resposta, ou contraste proposital. NUNCA deixe pronome órfão nem crie uma afirmação que a pessoa NÃO fez.
 
-## HONESTIDADE: recombine a ORDEM, mas nunca distorça o que a pessoa disse. Só use texto que existe na transcrição.
+## HONESTIDADE: recombine a ORDEM, nunca distorça o que a pessoa disse. Só use texto que existe na transcrição.
 
-## TAMANHO: cada montagem tem de 3 a 6 blocos (MÁXIMO 6). Menos é mais — uma montagem enxuta e afiada vale mais que uma colcha de retalhos. Nunca passe de 6.
-## DURAÇÃO: a faixa vem no pedido do usuário e é OBRIGATÓRIA — some as durações dos segmentos que escolher e fique dentro dela. Se a montagem ficar curta, adicione mais um bloco que aprofunde o argumento. Coerência do arco acima de tudo.
-## Só entregue montagens genuinamente mais fortes que um corte linear (score acima de ~65). Prefira 1-3 montagens excelentes a muitas medianas. Ordene do maior score para o menor. Use a ferramenta propose_montages.`;
+## TAMANHO: de 4 a 8 blocos, CADA UM de um momento diferente do vídeo.
+## Só entregue montagens genuinamente mais fortes que um corte linear (score acima de ~65). Ordene do maior score para o menor. Use a ferramenta propose_montages.`;
 
   var MONTAGE_SCHEMA = {
     type: "object",
@@ -449,9 +458,34 @@ A montagem tem que soar como UMA fala contínua e proposital.
     required: ["montagens"]
   };
 
+  // Uma montagem TEM que espalhar pelo video. Segmentos grudados numa regiao =
+  // corte linear disfarcado -> descarta. Trava em codigo porque a IA "joga seguro"
+  // pegando trechos vizinhos. Espelha core/objectives.py.
+  var MONTAGE_MIN_PIECES = 3, MONTAGE_MIN_SPREAD = 0.35;
+
+  function montageIsSpread(segIds, transcript) {
+    var starts = [];
+    for (var i = 0; i < segIds.length; i++) {
+      var s = segById(transcript, segIds[i]);
+      if (s) starts.push(s.start);
+    }
+    if (starts.length < MONTAGE_MIN_PIECES) return false;
+    var lo = Infinity, hi = -Infinity;
+    for (var k = 0; k < transcript.segments.length; k++) {
+      var seg = transcript.segments[k];
+      if (seg.start < lo) lo = seg.start;
+      if (seg.end > hi) hi = seg.end;
+    }
+    var total = hi - lo;
+    if (total <= 0) return true;
+    var span = Math.max.apply(null, starts) - Math.min.apply(null, starts);
+    return (span / total) >= MONTAGE_MIN_SPREAD;
+  }
+
   function resolveMontage(m, transcript, idx) {
-    var pieces = [];
     var segs = m.segments || [];
+    if (!montageIsSpread(segs, transcript)) return null; // grudado numa regiao: nao e frankenbite
+    var pieces = [];
     for (var j = 0; j < segs.length; j++) {
       var seg = segById(transcript, segs[j]);
       if (!seg || !seg.word_ids.length) continue;
@@ -462,7 +496,7 @@ A montagem tem que soar como UMA fala contínua e proposital.
       pieces.push({ start: Math.max(0, w0.start - PADDING), end: w1.end + PADDING, text: seg.text });
       if (pieces.length >= 8) break; // teto de seguranca: montagem nunca vira colcha gigante
     }
-    if (pieces.length < 2) return null;
+    if (pieces.length < MONTAGE_MIN_PIECES) return null;
     return {
       id: "frk_" + idx,
       titulo: m.titulo || ("Montagem " + (idx + 1)),
@@ -763,6 +797,7 @@ A montagem tem que soar como UMA fala contínua e proposital.
     _splitCut: splitCut,
     _buildCutPlan: buildCutPlan,
     _resolveClips: resolveClips,
+    _montageIsSpread: montageIsSpread,
     _secToTicks: secToTicks,
     _detectSpokenSpans: detectSpokenSpans,
     _readOpenAIKey: readOpenAIKey

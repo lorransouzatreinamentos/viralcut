@@ -81,4 +81,27 @@ function t(words) {
   assert.deepStrictEqual(plan.cuts.map((x) => x.project_item_id), ["A", "B"], "itens diferentes");
 })();
 
-console.log("OK: espelho timeline_map JS (remap + split + buildCutPlan)");
+// --- montagem: espalhamento (espelho de core/objectives.py) ---
+(function () {
+  // 20 segmentos de 5s cada (video de 100s)
+  const segs = [];
+  for (let i = 0; i < 20; i++) segs.push({ id: i, start: i * 5, end: i * 5 + 4.9, text: "f" + i, word_ids: [i] });
+  const t = { words: segs.map((s) => ({ id: s.id, text: s.text, start: s.start, end: s.end })), segments: segs };
+
+  assert.strictEqual(c._montageIsSpread([5, 6, 7, 8], t), false, "vizinhos = corte linear, rejeita");
+  assert.strictEqual(c._montageIsSpread([2, 9, 17], t), true, "comeco/meio/fim = espalhada, ok");
+  assert.strictEqual(c._montageIsSpread([1, 18], t), false, "so 2 pecas nao e montagem");
+})();
+
+// --- viral: faixa e grace band (fala completa perto da borda sobrevive) ---
+(function () {
+  // transcript: seg de ~20s
+  const words = [{ id: 0, text: "a", start: 10, end: 12 }, { id: 1, text: "b", start: 12, end: 30 }];
+  const segments = [{ id: 0, start: 10, end: 30, text: "fala 20s", word_ids: [0, 1] }];
+  const t = { words: words, segments: segments };
+  // min 30, max 40: grace floor = 15, teto = 60 -> 20s sobrevive
+  const kept = c._resolveClips([{ start_seg_id: 0, end_seg_id: 0, titulo: "x", score: 80 }], t, 30, 40);
+  assert.strictEqual(kept.length, 1, "fala completa de 20s com min 30 deveria sobreviver (grace)");
+})();
+
+console.log("OK: espelho timeline_map JS (remap + split + buildCutPlan + montagem + grace)");

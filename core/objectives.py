@@ -19,21 +19,27 @@ from core.model import TranscriptState
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 PADDING = 0.08
 
-SYSTEM_PROMPT_MONTAGE = """Voce e um editor senior e montador narrativo de cortes virais. Sua especialidade e o FRANKENBITE: costurar falas de MOMENTOS DIFERENTES de um mesmo video em portugues para construir uma narrativa nova, mais forte e mais viral do que qualquer trecho linear.
+SYSTEM_PROMPT_MONTAGE = """Voce e um editor senior e montador narrativo. Sua especialidade e o FRANKENBITE: costurar falas de MOMENTOS BEM DISTANTES de um mesmo video em portugues para construir uma NARRATIVA NOVA, mais forte que qualquer trecho linear.
 
 ENTRADA: transcricao SEGMENTADA (id, tempo, texto).
 SAIDA: para cada montagem, SOMENTE: segments (LISTA ORDENADA de ids na ordem de reproducao, NAO cronologica), titulo, hook_first_3s, motivo, score (0-100). NUNCA escreva timestamps, apenas ids.
 
-ARCO OBRIGATORIO (puxando de qualquer ponto do video):
-1. GANCHO CONTRA-INTUITIVO: a afirmacao mais forte/surpreendente do video, mesmo que dita no meio ou no fim. Comece pelo pico.
-2. DESENVOLVIMENTO: os blocos que sustentam/explicam o gancho, na ordem que constroi melhor o argumento.
-3. PAYOFF: a virada ou frase-tapa que fecha e faz compartilhar.
-A montagem tem que soar como UMA fala continua e proposital.
+REGRA MAIS IMPORTANTE -- ESPALHAMENTO:
+Os segmentos de UMA montagem TEM que vir de partes BEM DIFERENTES do video (comeco, meio E fim), nao de um mesmo trecho. Se voce pegar segmentos vizinhos/seguidos (ex: 12,13,14,15), isso NAO e montagem -- e so um corte linear, e esta ERRADO. O certo e SALTAR pelo video inteiro.
+EXEMPLO DE UMA BOA MONTAGEM (repare como os ids/tempos pulam por todo o video):
+  seg do minuto 0  ->  seg do minuto 2  ->  seg do minuto 0 de novo  ->  seg do minuto 3  ->  seg do minuto 1
+Cada bloco vem de um lugar distinto; juntos formam um raciocinio novo.
 
-COERENCIA: cada salto entre segmentos so vale se houver continuidade logica, tematica, pergunta->resposta, ou contraste proposital que faz sentido. NUNCA junte blocos onde um pronome fica orfao, o assunto muda de forma confusa, ou a costura cria uma afirmacao que a pessoa NAO fez.
-HONESTIDADE: recombine a ORDEM, mas nunca distorca o que a pessoa disse. Use apenas texto que existe na transcricao.
-TAMANHO: cada montagem tem de 3 a 6 blocos (MAXIMO 6). Menos e mais.
-So entregue montagens genuinamente mais fortes que um corte linear (score acima de ~65). Prefira 1-3 montagens excelentes. Ordene do maior score para o menor. Use a ferramenta propose_montages."""
+ARCO (puxando de QUALQUER ponto do video):
+1. GANCHO CONTRA-INTUITIVO: a afirmacao mais forte/surpreendente do video, mesmo que dita no meio ou no fim. Comece pelo pico.
+2. DESENVOLVIMENTO: blocos de OUTROS momentos que sustentam/explicam o gancho.
+3. PAYOFF: a virada ou frase-tapa que fecha e faz compartilhar.
+A montagem soa como UMA fala continua e proposital, MAS as pecas vem de lugares distantes.
+
+COERENCIA: cada salto so vale se houver continuidade logica, tematica, pergunta->resposta, ou contraste proposital. NUNCA deixe pronome orfao nem crie uma afirmacao que a pessoa NAO fez.
+HONESTIDADE: recombine a ORDEM, nunca distorca o que a pessoa disse. Use apenas texto que existe na transcricao.
+TAMANHO: de 4 a 8 blocos, CADA UM de um momento diferente do video.
+So entregue montagens genuinamente mais fortes que um corte linear (score acima de ~65). Ordene do maior score para o menor. Use a ferramenta propose_montages."""
 
 MONTAGE_SCHEMA = {
     "type": "object",
@@ -96,11 +102,41 @@ async def _call_openai_montage(transcript: TranscriptState, max_montages: int, m
     return json.loads(calls[0]["function"]["arguments"])
 
 
-def _resolve_montages(raw: dict, transcript: TranscriptState) -> list[dict]:
+# Uma montagem (frankenbite) TEM que espalhar pelo video. Se os segmentos ficam
+# grudados numa regiao, e um corte linear disfarcado -> descarta. Trava em CODIGO
+# porque a IA tende a "jogar seguro" pegando trechos vizinhos.
+MONTAGE_MIN_PIECES = 3      # menos que isso nao e montagem
+MONTAGE_MIN_SPREAD = 0.35   # os trechos escolhidos cobrem >=35% da duracao do video
+
+
+def _montage_is_spread(seg_ids: list[int], transcript: TranscriptState) -> bool:
+    starts = []
+    for sid in seg_ids:
+        try:
+            starts.append(transcript.segment_by_id(sid).start)
+        except KeyError:
+            pass
+    if len(starts) < MONTAGE_MIN_PIECES:
+        return False
+    video_lo = min(s.start for s in transcript.segments)
+    video_hi = max(s.end for s in transcript.segments)
+    total = video_hi - video_lo
+    if total <= 0:
+        return True  # video degenerado (tudo no mesmo instante): nao trava
+    return (max(starts) - min(starts)) / total >= MONTAGE_MIN_SPREAD
+
+
+def _resolve_montages(raw: dict, transcript: TranscriptState) -> tuple[list[dict], int]:
     montages = []
+    rejeitadas_agrupadas = 0
     for idx, m in enumerate(raw.get("montagens", [])):
+        seg_ids = m.get("segments", [])
+        # trava de espalhamento: montagem grudada numa regiao nao e frankenbite
+        if not _montage_is_spread(seg_ids, transcript):
+            rejeitadas_agrupadas += 1
+            continue
         pieces = []
-        for seg_id in m.get("segments", []):
+        for seg_id in seg_ids:
             try:
                 seg = transcript.segment_by_id(seg_id)
             except KeyError:
@@ -112,7 +148,7 @@ def _resolve_montages(raw: dict, transcript: TranscriptState) -> list[dict]:
             pieces.append({"start": max(0.0, w0.start - PADDING), "end": w1.end + PADDING, "text": seg.text})
             if len(pieces) >= 8:
                 break
-        if len(pieces) < 2:
+        if len(pieces) < MONTAGE_MIN_PIECES:
             continue
         montages.append({
             "id": f"frk_{idx}",
@@ -124,14 +160,15 @@ def _resolve_montages(raw: dict, transcript: TranscriptState) -> list[dict]:
             "text": "  //  ".join(p["text"] for p in pieces),
         })
     montages.sort(key=lambda x: x["score"], reverse=True)
-    return montages
+    return montages, rejeitadas_agrupadas
 
 
 async def extract_montages(transcript: TranscriptState, max_montages: int = 3, min_dur: float = 15, max_dur: float = 90) -> list[dict]:
     if not transcript.segments:
         return []
     raw = await _call_openai_montage(transcript, max_montages, min_dur, max_dur)
-    return _resolve_montages(raw, transcript)
+    montages, _rejeitadas = _resolve_montages(raw, transcript)
+    return montages
 
 
 # ---------------------------------------------------------------------------
