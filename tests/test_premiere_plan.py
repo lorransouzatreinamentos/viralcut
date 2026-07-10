@@ -27,10 +27,9 @@ def test_seconds_to_ticks_whole_second_30fps():
 
 
 def test_seconds_to_ticks_snaps_to_frame():
-    """1.02s @ 30fps nao e fronteira de frame -> snap para o frame 31 (1.0333s)."""
-    # frame = round(1.02*30) = 31; ticks = 31 * (254016000000/30) = 31 * 8467200000
-    expected = str(31 * (TICKS_PER_SECOND // 30))
-    assert seconds_to_frame_snapped_ticks(1.02, 30.0) == expected
+    """1.02s @ 30fps: direcional. 'in' usa floor -> frame 30; 'out' usa ceil -> 31."""
+    assert seconds_to_frame_snapped_ticks(1.02, 30.0, "in") == str(30 * (TICKS_PER_SECOND // 30))
+    assert seconds_to_frame_snapped_ticks(1.02, 30.0, "out") == str(31 * (TICKS_PER_SECOND // 30))
 
 
 def test_seconds_to_ticks_returns_string():
@@ -40,10 +39,10 @@ def test_seconds_to_ticks_returns_string():
 
 
 def test_2997_fps_ticks_are_integer():
-    """254016000000 divide 29.97 exatamente (nao gera tick fracionario)."""
-    # 1s @ 29.97 -> frame 30 -> 30 * 254016000000/29.97
-    result = int(seconds_to_frame_snapped_ticks(1.0, 29.97))
-    assert result == round(30 * TICKS_PER_SECOND / 29.97)
+    """254016000000 divide 29.97 exatamente. Direcional: 'in' 1s -> floor(29.97)=29."""
+    import math
+    result = int(seconds_to_frame_snapped_ticks(1.0, 29.97, "in"))
+    assert result == round(math.floor(1.0 * 29.97) * TICKS_PER_SECOND / 29.97)
 
 
 def test_build_plan_simple_single_source():

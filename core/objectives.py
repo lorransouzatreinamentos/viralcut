@@ -89,8 +89,12 @@ async def _call_openai_montage(transcript: TranscriptState, request_count: int, 
             OPENAI_URL,
             headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
             json={
+                # Montagem PRECISA de variedade (varias narrativas diferentes). Com
+                # temperature baixa a IA devolvia montagens quase iguais que colapsavam
+                # em 1 apos dedup. Cortes virais mantem temp baixa (precisao); aqui e
+                # o oposto -- queremos diversidade entre as propostas.
                 "model": model,
-                "temperature": 0.1,
+                "temperature": 0.8,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT_MONTAGE},
                     {"role": "user", "content": user},
@@ -110,35 +114,90 @@ async def _call_openai_montage(transcript: TranscriptState, request_count: int, 
 # Uma montagem (frankenbite) TEM que espalhar pelo video. Se os segmentos ficam
 # grudados numa regiao, e um corte linear disfarcado -> descarta. Trava em CODIGO
 # porque a IA tende a "jogar seguro" pegando trechos vizinhos.
-MONTAGE_MIN_PIECES = 3      # menos que isso nao e montagem
-MONTAGE_MIN_SPREAD = 0.35   # os trechos escolhidos cobrem >=35% da duracao do video
+MONTAGE_MIN_PIECES = 3       # menos que isso nao e montagem
+MONTAGE_MIN_SPREAD = 0.35    # os trechos escolhidos cobrem >=35% da duracao do video
+MONTAGE_MAX_ADJACENT = 0.5   # no maximo 50% das transicoes podem ser entre segmentos vizinhos
 
 
 def _montage_is_spread(seg_ids: list[int], transcript: TranscriptState) -> bool:
-    starts = []
-    for sid in seg_ids:
-        try:
-            starts.append(transcript.segment_by_id(sid).start)
-        except KeyError:
-            pass
-    if len(starts) < MONTAGE_MIN_PIECES:
+    """Duas travas contra 'agrupar momentos similares':
+    1. COBERTURA: os trechos cobrem >=35% da duracao do video (min-max span).
+    2. ADJACENCIA: os segmentos nao podem ser majoritariamente vizinhos (ids
+       consecutivos = falas seguidas no video). So (1) tinha um buraco: [0,1,2,50]
+       cobre muito mas 0,1,2 sao colados -- e um corte linear + 1 outlier."""
+    valid_ids = [sid for sid in seg_ids if _has_segment(transcript, sid)]
+    if len(valid_ids) < MONTAGE_MIN_PIECES:
         return False
+
+    starts = [transcript.segment_by_id(sid).start for sid in valid_ids]
     video_lo = min(s.start for s in transcript.segments)
     video_hi = max(s.end for s in transcript.segments)
     total = video_hi - video_lo
-    if total <= 0:
-        return True  # video degenerado (tudo no mesmo instante): nao trava
-    return (max(starts) - min(starts)) / total >= MONTAGE_MIN_SPREAD
+    if total > 0 and (max(starts) - min(starts)) / total < MONTAGE_MIN_SPREAD:
+        return False  # concentrado numa regiao
+
+    # adjacencia: quantos segmentos escolhidos tem um vizinho (id+1) tambem escolhido
+    picked = set(valid_ids)
+    adjacent_pairs = sum(1 for sid in valid_ids if (sid + 1) in picked)
+    if adjacent_pairs > (len(valid_ids) - 1) * MONTAGE_MAX_ADJACENT:
+        return False  # e uma sequencia de falas seguidas, nao saltos pelo video
+    return True
+
+
+def _has_segment(transcript: TranscriptState, seg_id: int) -> bool:
+    try:
+        transcript.segment_by_id(seg_id)
+        return True
+    except KeyError:
+        return False
+
+
+def _piece_span(seg, transcript, words_sorted: list, idx_by_start: dict) -> dict:
+    """Timecode de um trecho da montagem com padding ADAPTATIVO (mesma logica dos
+    silencios): o `end` do Whisper e o fim do fonema, nao do som audivel. Um
+    padding fixo pequeno decepa a ultima silaba -- e o 'come palavras' da montagem.
+    A cauda estende ate a proxima palavra falada, sem invadi-la."""
+    w0 = transcript.word_by_id(seg.word_ids[0])
+    w1 = transcript.word_by_id(seg.word_ids[-1])
+
+    # palavra anterior a w0 e posterior a w1 na linha do tempo (para nao invadir)
+    i0 = idx_by_start.get(w0.id, 0)
+    i1 = idx_by_start.get(w1.id, len(words_sorted) - 1)
+    prev_end = words_sorted[i0 - 1].end if i0 > 0 else 0.0
+    next_start = words_sorted[i1 + 1].start if i1 + 1 < len(words_sorted) else (w1.end + TAIL_PAD_MAX)
+
+    headroom = max(0.0, w0.start - prev_end)
+    tailroom = max(0.0, next_start - w1.end)
+    head = min(HEAD_PAD_MAX, headroom * 0.5)
+    tail = min(TAIL_PAD_MAX, tailroom * TAIL_PAD_RATIO)
+    return {"start": max(0.0, w0.start - head), "end": w1.end + tail, "text": seg.text}
+
+
+def _segments_too_similar(a: list[int], b: list[int]) -> bool:
+    """Duas montagens que compartilham a maioria dos segmentos sao a 'mesma
+    variacao' -- a temperatura baixa gerava clones. Considera duplicata se a
+    sobreposicao passa de 60% do menor conjunto."""
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return False
+    return len(sa & sb) / min(len(sa), len(sb)) > 0.6
 
 
 def _resolve_montages(raw: dict, transcript: TranscriptState) -> tuple[list[dict], int]:
     montages = []
     rejeitadas_agrupadas = 0
+    words_sorted = sorted(transcript.words, key=lambda w: w.start)
+    idx_by_start = {w.id: i for i, w in enumerate(words_sorted)}
+    kept_segments: list[list[int]] = []  # para dedup de montagens quase iguais
+
     for idx, m in enumerate(raw.get("montagens", [])):
         seg_ids = m.get("segments", [])
         # trava de espalhamento: montagem grudada numa regiao nao e frankenbite
         if not _montage_is_spread(seg_ids, transcript):
             rejeitadas_agrupadas += 1
+            continue
+        # dedup: nao entregar duas montagens que sao basicamente a mesma
+        if any(_segments_too_similar(seg_ids, prev) for prev in kept_segments):
             continue
         pieces = []
         for seg_id in seg_ids:
@@ -148,13 +207,12 @@ def _resolve_montages(raw: dict, transcript: TranscriptState) -> tuple[list[dict
                 continue
             if not seg.word_ids:
                 continue
-            w0 = transcript.word_by_id(seg.word_ids[0])
-            w1 = transcript.word_by_id(seg.word_ids[-1])
-            pieces.append({"start": max(0.0, w0.start - PADDING), "end": w1.end + PADDING, "text": seg.text})
+            pieces.append(_piece_span(seg, transcript, words_sorted, idx_by_start))
             if len(pieces) >= 8:
                 break
         if len(pieces) < MONTAGE_MIN_PIECES:
             continue
+        kept_segments.append(seg_ids)
         montages.append({
             "id": f"frk_{idx}",
             "titulo": m.get("titulo", f"Montagem {idx + 1}"),

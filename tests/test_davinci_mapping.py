@@ -122,15 +122,17 @@ def test_item_without_media_is_skipped():
 
 
 def test_2997_fps_frame_math():
-    """29.97 nao quebra: trabalhamos em frames inteiros, round() resolve o resto."""
+    """29.97 nao quebra: frames inteiros com arredondamento DIRECIONAL (floor no
+    inicio, ceil no fim) -- o corte nunca encolhe."""
+    import math
     items = [TimelineItemDesc(start=0, end=100000, left_offset=0, media_pool_item="M")]
     clips = [_clip(10.0, 20.0)]
 
     infos, warnings = build_clip_infos(clips, items, timeline_start_frame=0, fps=29.97)
 
     assert warnings == []
-    assert infos[0]["startFrame"] == round(10.0 * 29.97)  # 300
-    assert infos[0]["endFrame"] == round(20.0 * 29.97)    # 599
+    assert infos[0]["startFrame"] == math.floor(10.0 * 29.97)  # 299
+    assert infos[0]["endFrame"] == math.ceil(20.0 * 29.97)     # 600
 
 
 def test_multiple_clips_mapped_independently():

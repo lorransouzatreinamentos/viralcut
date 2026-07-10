@@ -15,6 +15,7 @@ Fatos de plataforma (pesquisa das APIs reais):
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,14 +37,14 @@ _COLOR_TO_PREMIERE_INDEX = {
 _DEFAULT_LABEL_INDEX = 2  # Caribbean — cor de destaque distinta para cortes virais
 
 
-def seconds_to_frame_snapped_ticks(sec: float, fps: float) -> str:
+def seconds_to_frame_snapped_ticks(sec: float, fps: float, direction: str = "in") -> str:
     """Converte segundos para ticks-string, GRAMPEADO na fronteira de frame.
 
-    Snap ao frame evita o corte cair 'entre frames' (fonte de imprecisao de
-    1 frame). Como TICKS_PER_SECOND divide exatamente os fps comuns,
-    frame * ticks_per_frame e sempre inteiro.
+    Arredondamento DIRECIONAL (igual ao core-cep.js e ao build_clip_infos): a
+    entrada usa floor, a saida usa ceil -- o corte nunca encolhe (round nos dois
+    lados perdia ate meio frame no fim, decepando a silaba final).
     """
-    frame = round(sec * fps)
+    frame = math.floor(sec * fps) if direction == "in" else math.ceil(sec * fps)
     ticks = round(frame * TICKS_PER_SECOND / fps)
     return str(ticks)
 
@@ -112,8 +113,8 @@ def build_cut_plan(
             "id": clip.id,
             "titulo": clip.titulo,
             "project_item_id": item.project_item_id,
-            "in_ticks": seconds_to_frame_snapped_ticks(source_in, fps),
-            "out_ticks": seconds_to_frame_snapped_ticks(source_out, fps),
+            "in_ticks": seconds_to_frame_snapped_ticks(source_in, fps, "in"),
+            "out_ticks": seconds_to_frame_snapped_ticks(source_out, fps, "out"),
             "offset_sec": running_offset,
             "label_index": _label_index(clip.color),
         })

@@ -72,8 +72,11 @@ def test_resolve_and_filter_derives_real_timecode_not_llm_number():
     clips, _ = _resolve_and_filter(raw_input, transcript, min_score=50, max_clips=10)
 
     assert len(clips) == 1
-    assert clips[0].start == pytest.approx(12.00 - 0.08)  # padding default de resolve_highlight
-    assert clips[0].end == pytest.approx(13.40 + 0.08)
+    # timecode DERIVADO das palavras (word0.start .. word4.end) com padding adaptativo,
+    # nunca de um numero da IA. start na janela do head, end estendido pela cauda.
+    assert 12.00 - 0.10 <= clips[0].start <= 12.00
+    assert 13.40 < clips[0].end <= 13.40 + 0.25
+    assert clips[0].start_word_id == 0 and clips[0].end_word_id == 4
     assert clips[0].titulo == "O erro"
 
 

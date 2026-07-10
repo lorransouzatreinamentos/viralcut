@@ -91,6 +91,30 @@ function t(words) {
   assert.strictEqual(c._montageIsSpread([5, 6, 7, 8], t), false, "vizinhos = corte linear, rejeita");
   assert.strictEqual(c._montageIsSpread([2, 9, 17], t), true, "comeco/meio/fim = espalhada, ok");
   assert.strictEqual(c._montageIsSpread([1, 18], t), false, "so 2 pecas nao e montagem");
+  // buraco da adjacencia (espelho do Python): span alto mas 0,1,2 colados -> rejeita
+  assert.strictEqual(c._montageIsSpread([0, 1, 2, 18], t), false, "span alto + segmentos colados = rejeita");
+  assert.strictEqual(c._montageIsSpread([1, 6, 7, 14, 19], t), true, "1 par vizinho entre saltos = ok");
+  // dedup de montagens quase iguais
+  assert.strictEqual(c._segmentsTooSimilar([1, 2, 3, 4], [1, 2, 3, 9]), true, "3/4 = clone");
+  assert.strictEqual(c._segmentsTooSimilar([1, 2, 3, 4], [1, 5, 6, 7]), false, "1/4 = diferente");
+})();
+
+// --- viral: resolveClips filtra por score e corta em maxClips (espelho do Python) ---
+(function () {
+  const segs = [];
+  for (let i = 0; i < 6; i++) segs.push({ id: i, start: i * 40, end: i * 40 + 30, text: "s" + i, word_ids: [i] });
+  const words = segs.map((s) => ({ id: s.id, text: s.text, start: s.start, end: s.end }));
+  const t = { words: words, segments: segs };
+  const raw = [
+    { start_seg_id: 0, end_seg_id: 0, titulo: "bom", score: 80 },
+    { start_seg_id: 1, end_seg_id: 1, titulo: "fraco", score: 20 },   // abaixo do minScore
+    { start_seg_id: 2, end_seg_id: 2, titulo: "ok", score: 60 },
+    { start_seg_id: 3, end_seg_id: 3, titulo: "medio", score: 55 },
+  ];
+  const out = c._resolveClips(raw, t, 5, 60, 45, 2);  // minScore 45, maxClips 2
+  assert.strictEqual(out.length, 2, "deveria cortar em maxClips=2");
+  assert.ok(out.every((x) => x.score >= 45), "nao deveria manter score < minScore");
+  assert.strictEqual(out[0].titulo, "bom", "ordenado por score desc");
 })();
 
 // --- viral: faixa e grace band (fala completa perto da borda sobrevive) ---

@@ -7,6 +7,7 @@ a partir do FastAPI deve rodar via asyncio.to_thread para nao bloquear o event l
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -152,8 +153,11 @@ def build_clip_infos(
     ordered_items = sorted(timeline_items, key=lambda it: it.start)
 
     for clip in clips:
-        cut_start_tl = timeline_start_frame + round(clip.start * fps)
-        cut_end_tl = timeline_start_frame + round(clip.end * fps)
+        # arredondamento DIRECIONAL (igual ao core-cep.js): floor na entrada, ceil na
+        # saida -- o corte nunca encolhe. round nos dois lados perdia ate meio frame no
+        # fim, decepando a silaba final.
+        cut_start_tl = timeline_start_frame + math.floor(clip.start * fps)
+        cut_end_tl = timeline_start_frame + math.ceil(clip.end * fps)
 
         intersected = False
         for item in ordered_items:

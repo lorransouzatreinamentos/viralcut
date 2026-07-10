@@ -124,11 +124,19 @@ class HighlightClip(BaseModel):
         return self
 
 
+# Padding ADAPTATIVO (mesma logica dos silencios em objectives.py e do adaptivePad
+# no core-cep.js). O `end` do Whisper e o fim do fonema, nao do som audivel; um
+# padding fixo pequeno decepa a ultima silaba (o "come palavras"). A cauda estende
+# ate a proxima palavra falada, sem invadi-la.
+_HEAD_PAD_MAX = 0.10
+_TAIL_PAD_MAX = 0.25
+_TAIL_PAD_RATIO = 0.8
+
+
 def resolve_highlight(
     raw: LLMHighlightRaw,
     transcript: TranscriptState,
     clip_id: str,
-    padding_sec: float = 0.08,
 ) -> HighlightClip:
     """Unico caminho para transformar uma proposta da IA num corte aplicavel.
 
@@ -151,8 +159,14 @@ def resolve_highlight(
     start_word = transcript.word_by_id(start_word_id)
     end_word = transcript.word_by_id(end_word_id)
 
-    start = max(0.0, start_word.start - padding_sec)
-    end = end_word.end + padding_sec
+    # padding adaptativo: usa a folga real ate a palavra vizinha (nunca invade)
+    prev_end = max((w.end for w in transcript.words if w.end <= start_word.start), default=0.0)
+    next_start = min((w.start for w in transcript.words if w.start >= end_word.end),
+                     default=end_word.end + _TAIL_PAD_MAX)
+    head = min(_HEAD_PAD_MAX, max(0.0, start_word.start - prev_end) * 0.5)
+    tail = min(_TAIL_PAD_MAX, max(0.0, next_start - end_word.end) * _TAIL_PAD_RATIO)
+    start = max(0.0, start_word.start - head)
+    end = end_word.end + tail
 
     # texto completo dos segmentos (nao reconstruido das palavras, que o Whisper
     # as vezes omite deixando o preview picotado)

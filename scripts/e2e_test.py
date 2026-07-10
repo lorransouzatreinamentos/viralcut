@@ -26,11 +26,12 @@ async def main(audio_path: str):
         print(f"  [{c.score}] {c.titulo}  ({c.start:.1f}s–{c.end:.1f}s, {c.end-c.start:.0f}s)")
         print(f"       hook: {c.hook_first_3s}")
         print(f"       texto real no intervalo: \"{' '.join(words_in)}\"")
-        # invariante: start/end batem com as palavras referenciadas
+        # invariante: start/end derivam das palavras referenciadas (padding adaptativo:
+        # head <= 0.10 antes da 1a palavra; cauda <= 0.25 estendida apos a ultima)
         w0 = transcript.word_by_id(c.start_word_id)
         w1 = transcript.word_by_id(c.end_word_id)
-        assert abs(c.start - (w0.start - 0.08)) < 0.001 or c.start == 0.0, "start nao deriva da palavra!"
-        assert abs(c.end - (w1.end + 0.08)) < 0.001, "end nao deriva da palavra!"
+        assert w0.start - 0.10 - 1e-6 <= c.start <= w0.start + 1e-6, "start nao deriva da palavra!"
+        assert w1.end - 1e-6 <= c.end <= w1.end + 0.25 + 1e-6, "end nao deriva da palavra!"
         print()
 
     print("OK — todos os cortes tem timecode derivado das palavras reais (invariante PLANO 1.1).")

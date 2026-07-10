@@ -9,7 +9,13 @@ rejeitada; montagem que salta por comeco/meio/fim passa.
 import asyncio
 
 from core.model import Segment, TranscriptState, Word
-from core.objectives import MONTAGE_REQUEST_BUFFER, _montage_is_spread, _resolve_montages, extract_montages
+from core.objectives import (
+    MONTAGE_REQUEST_BUFFER,
+    _montage_is_spread,
+    _resolve_montages,
+    _segments_too_similar,
+    extract_montages,
+)
 
 
 def _transcript(n=20, seg_len=5.0):
@@ -49,6 +55,70 @@ def test_resolve_descarta_agrupada_e_mantem_espalhada():
 
     assert [m["titulo"] for m in montages] == ["espalhada"]
     assert rejeitadas == 1
+
+
+# --- "ainda agrupando momentos similares": buraco do span (adjacencia) -------
+
+def test_span_alto_mas_segmentos_colados_e_rejeitada():
+    """O buraco do filtro antigo: [0,1,2,18] cobre quase todo o video (span alto)
+    mas 0,1,2 sao falas SEGUIDAS -- e um corte linear + 1 outlier, nao frankenbite."""
+    t = _transcript(n=20)
+    assert _montage_is_spread([0, 1, 2, 18], t) is False
+
+
+def test_saltos_reais_com_um_par_vizinho_ainda_passa():
+    """Como no exemplo do usuario: pode ter 1 par vizinho (00:32, 00:38) desde que
+    o resto salte pelo video."""
+    t = _transcript(n=20)
+    assert _montage_is_spread([1, 6, 7, 14, 19], t) is True  # so (6,7) sao vizinhos
+
+
+# --- "gerando apenas 1 variacao": dedup de montagens quase iguais ------------
+
+def test_montagens_quase_iguais_sao_deduplicadas():
+    """Temperatura baixa gerava montagens quase identicas. As duas primeiras
+    compartilham 3 de 4 segmentos (>60%) -> a segunda e descartada como clone."""
+    t = _transcript(n=20)
+    raw = {"montagens": [
+        {"segments": [0, 7, 14, 19], "titulo": "original", "score": 90},
+        {"segments": [0, 7, 14, 18], "titulo": "quase igual", "score": 88},  # 3/4 iguais
+        {"segments": [2, 5, 11, 17], "titulo": "diferente", "score": 70},
+    ]}
+    montages, _rej = _resolve_montages(raw, t)
+
+    titulos = [m["titulo"] for m in montages]
+    assert "original" in titulos and "diferente" in titulos
+    assert "quase igual" not in titulos, "montagem clone deveria ter sido deduplicada"
+
+
+def test_segments_too_similar():
+    assert _segments_too_similar([1, 2, 3, 4], [1, 2, 3, 9]) is True    # 3/4
+    assert _segments_too_similar([1, 2, 3, 4], [1, 5, 6, 7]) is False   # 1/4
+
+
+# --- "comendo palavras": padding adaptativo por trecho ----------------------
+
+def test_trecho_da_montagem_estende_a_cauda_ate_o_silencio():
+    """O `end` do Whisper e o fim do fonema. Antes, padding fixo de 0.08 decepava
+    a ultima silaba. Agora a cauda se estende ate a proxima palavra (sem invadi-la)."""
+    # seg 0: palavra termina em 1.0; proxima palavra so em 3.0 -> muita folga
+    words = [
+        Word(id=0, text="fim", start=0.5, end=1.0),
+        Word(id=1, text="prox", start=3.0, end=3.5),
+        Word(id=2, text="meio", start=6.0, end=6.5),
+        Word(id=3, text="tres", start=9.0, end=9.5),
+    ]
+    segs = [Segment(id=i, start=w.start, end=w.end, text=w.text, word_ids=[i]) for i, w in enumerate(words)]
+    t = TranscriptState(words=words, segments=segs)
+    raw = {"montagens": [{"segments": [0, 2, 3], "titulo": "x", "score": 80}]}
+
+    montages, _rej = _resolve_montages(raw, t)
+
+    assert len(montages) == 1
+    fim = montages[0]["pieces"][0]  # trecho do seg 0
+    # cauda estendida alem de 1.0 (fim do fonema) -- nao mais o fixo 1.08
+    assert fim["end"] > 1.08, "cauda nao foi estendida -- ainda comeria a silaba final"
+    assert fim["end"] <= 1.0 + 0.25 + 1e-9, "cauda nao pode passar do teto de 0.25s"
 
 
 # --- o bug reportado: "pedi 3, veio 1" -------------------------------------

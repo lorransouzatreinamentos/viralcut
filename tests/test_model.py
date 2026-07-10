@@ -48,33 +48,40 @@ def test_resolve_highlight_derives_timecode_from_words_not_llm():
     transcript = _sample_transcript()
     raw = LLMHighlightRaw(start_seg_id=0, end_seg_id=1, titulo="O erro", score=87)
 
-    clip = resolve_highlight(raw, transcript, clip_id="vir_001", padding_sec=0.0)
+    clip = resolve_highlight(raw, transcript, clip_id="vir_001")
 
-    # start/end vem EXATAMENTE das palavras (word 0 e word 4), nao de nada que a IA "escreveu"
-    assert clip.start == pytest.approx(12.00)
-    assert clip.end == pytest.approx(13.40)
+    # word ids vem EXATAMENTE das palavras (word 0 e word 4), nao de nada que a IA "escreveu"
     assert clip.start_word_id == 0
     assert clip.end_word_id == 4
     assert clip.score == 87
+    # start/end sao DERIVADOS das palavras (com padding adaptativo), nunca de um numero da IA:
+    # start fica na janela [word0.start - HEAD_MAX, word0.start]; end em [word4.end, word4.end + TAIL_MAX]
+    assert 12.00 - 0.10 <= clip.start <= 12.00
+    assert 13.40 <= clip.end <= 13.40 + 0.25
 
 
-def test_resolve_highlight_applies_padding():
+def test_resolve_highlight_padding_adaptativo_estende_a_cauda():
+    """A cauda estende alem do fim do fonema (anti 'come palavras'), respeitando o teto."""
     transcript = _sample_transcript()
     raw = LLMHighlightRaw(start_seg_id=0, end_seg_id=1, titulo="O erro")
 
-    clip = resolve_highlight(raw, transcript, clip_id="vir_001", padding_sec=0.08)
+    clip = resolve_highlight(raw, transcript, clip_id="vir_001")
 
-    assert clip.start == pytest.approx(12.00 - 0.08)
-    assert clip.end == pytest.approx(13.40 + 0.08)
+    assert clip.end > 13.40, "cauda nao foi estendida -- comeria a silaba final"
+    assert clip.end <= 13.40 + 0.25 + 1e-9
+    assert clip.start < 12.00, "head nao aplicado"
 
 
-def test_resolve_highlight_padding_never_goes_negative():
-    transcript = _sample_transcript()
+def test_resolve_highlight_nunca_fica_negativo():
+    """Video que comeca logo no inicio: o head nunca empurra o start abaixo de 0."""
+    words = [Word(id=0, text="ja", start=0.05, end=0.30)]
+    segs = [Segment(id=0, start=0.05, end=0.30, text="ja", word_ids=[0])]
+    transcript = TranscriptState(words=words, segments=segs)
     raw = LLMHighlightRaw(start_seg_id=0, end_seg_id=0, titulo="Inicio")
 
-    clip = resolve_highlight(raw, transcript, clip_id="vir_001", padding_sec=999.0)
+    clip = resolve_highlight(raw, transcript, clip_id="vir_001")
 
-    assert clip.start == 0.0
+    assert clip.start >= 0.0
 
 
 def test_llm_raw_rejects_end_before_start():

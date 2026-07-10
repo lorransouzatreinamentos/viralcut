@@ -275,10 +275,12 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   };
 
   // Chamada generica de LLM com function calling + LOG (prompt enviado + resposta).
-  async function gptCall(apiKey, systemPrompt, userPrompt, toolName, schema, logSink) {
+  // temperature: cortes virais usam baixa (0.1, selecao precisa); montagem usa
+  // alta (0.8) para gerar variacoes genuinamente diferentes.
+  async function gptCall(apiKey, systemPrompt, userPrompt, toolName, schema, logSink, temperature) {
     var body = {
       model: CHAT_MODEL,
-      temperature: 0.1,
+      temperature: typeof temperature === "number" ? temperature : 0.1,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt }
@@ -324,17 +326,39 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   // So descartamos fragmentos/arrastados absurdos.
   var GRACE_UNDER = 0.5, GRACE_OVER = 1.5, ABS_FLOOR = 6, ABS_CEIL = 180;
 
-  function resolveClips(raw, transcript, minDur, maxDur) {
+  // Padding ADAPTATIVO de um trecho [w0..w1] (anti "come palavras"): o `end` do
+  // Whisper e o fim do fonema, nao do som audivel -- padding fixo pequeno decepa
+  // a ultima silaba. A cauda estende ate a proxima palavra (na linha do tempo),
+  // sem invadi-la. Usa as constantes HEAD_PAD_MAX/TAIL_PAD_MAX/TAIL_PAD_RATIO
+  // (definidas junto do padSpans dos silencios, mesma logica ja validada).
+  function adaptivePad(w0, w1, wordsSorted, idxByStart) {
+    var i0 = idxByStart[w0.id] != null ? idxByStart[w0.id] : 0;
+    var i1 = idxByStart[w1.id] != null ? idxByStart[w1.id] : wordsSorted.length - 1;
+    var prevEnd = i0 > 0 ? wordsSorted[i0 - 1].end : 0;
+    var nextStart = (i1 + 1 < wordsSorted.length) ? wordsSorted[i1 + 1].start : (w1.end + TAIL_PAD_MAX);
+    var head = Math.min(HEAD_PAD_MAX, Math.max(0, w0.start - prevEnd) * 0.5);
+    var tail = Math.min(TAIL_PAD_MAX, Math.max(0, nextStart - w1.end) * TAIL_PAD_RATIO);
+    return { start: Math.max(0, w0.start - head), end: w1.end + tail };
+  }
+
+  function resolveClips(raw, transcript, minDur, maxDur, minScore, maxClips) {
     var out = [];
     var rejected = { curto: 0, longo: 0 };
     var lo = minDur ? Math.max(ABS_FLOOR, minDur * GRACE_UNDER) : 0;
     var hi = maxDur ? Math.min(ABS_CEIL, maxDur * GRACE_OVER) : Infinity;
+    // padding adaptativo (anti "come palavras"): mesma logica dos silencios
+    var wordsSorted = transcript.words.slice().sort(function (a, b) { return a.start - b.start; });
+    var idxByStart = {};
+    for (var wi = 0; wi < wordsSorted.length; wi++) idxByStart[wordsSorted[wi].id] = wi;
+
     for (var i = 0; i < raw.length; i++) {
       var r = raw[i];
       var sSeg = segById(transcript, r.start_seg_id);
       var eSeg = segById(transcript, r.end_seg_id);
       if (!sSeg || !eSeg || !sSeg.word_ids.length || !eSeg.word_ids.length) continue;
       if (r.end_seg_id < r.start_seg_id) continue;
+      var score = typeof r.score === "number" ? r.score : 50;
+      if (minScore && score < minScore) continue;  // espelha o Python (_resolve_and_filter)
 
       var startWordId = sSeg.word_ids[0];
       var endWordId = eSeg.word_ids[eSeg.word_ids.length - 1];
@@ -342,8 +366,8 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
       var w1 = wordById(transcript, endWordId);
       if (!w0 || !w1) continue;
 
-      var start = Math.max(0, w0.start - PADDING);
-      var end = w1.end + PADDING;
+      var pad = adaptivePad(w0, w1, wordsSorted, idxByStart);
+      var start = pad.start, end = pad.end;
       if (end <= start) continue;
 
       var dur = end - start;
@@ -364,7 +388,7 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
         titulo: r.titulo || ("Corte " + (i + 1)),
         hook_first_3s: r.hook_first_3s || "",
         motivo: r.motivo || "",
-        score: typeof r.score === "number" ? r.score : 50,
+        score: score,
         start: start, end: end,
         start_word_id: startWordId, end_word_id: endWordId,
         color_index: COLOR_CYCLE[i % COLOR_CYCLE.length],
@@ -372,6 +396,7 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
       });
     }
     out.sort(function (a, b) { return b.score - a.score; });
+    if (maxClips) out = out.slice(0, maxClips);  // espelha clips[:max_clips] do Python
     out._rejected = rejected;
     return out;
   }
@@ -474,18 +499,20 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
     required: ["montagens"]
   };
 
-  // Uma montagem TEM que espalhar pelo video. Segmentos grudados numa regiao =
-  // corte linear disfarcado -> descarta. Trava em codigo porque a IA "joga seguro"
-  // pegando trechos vizinhos. Espelha core/objectives.py.
-  var MONTAGE_MIN_PIECES = 3, MONTAGE_MIN_SPREAD = 0.35;
+  // Uma montagem TEM que espalhar pelo video. Duas travas (espelha objectives.py):
+  // 1. COBERTURA: trechos cobrem >=35% da duracao. 2. ADJACENCIA: segmentos nao
+  // podem ser majoritariamente vizinhos (ids consecutivos = falas seguidas). Sem
+  // (2), [0,1,2,50] passava (span alto) mas 0,1,2 sao colados = corte linear.
+  var MONTAGE_MIN_PIECES = 3, MONTAGE_MIN_SPREAD = 0.35, MONTAGE_MAX_ADJACENT = 0.5;
 
   function montageIsSpread(segIds, transcript) {
-    var starts = [];
+    var validIds = [], starts = [];
     for (var i = 0; i < segIds.length; i++) {
       var s = segById(transcript, segIds[i]);
-      if (s) starts.push(s.start);
+      if (s) { validIds.push(segIds[i]); starts.push(s.start); }
     }
-    if (starts.length < MONTAGE_MIN_PIECES) return false;
+    if (validIds.length < MONTAGE_MIN_PIECES) return false;
+
     var lo = Infinity, hi = -Infinity;
     for (var k = 0; k < transcript.segments.length; k++) {
       var seg = transcript.segments[k];
@@ -493,23 +520,47 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
       if (seg.end > hi) hi = seg.end;
     }
     var total = hi - lo;
-    if (total <= 0) return true;
     var span = Math.max.apply(null, starts) - Math.min.apply(null, starts);
-    return (span / total) >= MONTAGE_MIN_SPREAD;
+    if (total > 0 && (span / total) < MONTAGE_MIN_SPREAD) return false; // concentrado
+
+    // adjacencia: quantos segmentos escolhidos tem um vizinho (id+1) tambem escolhido
+    var picked = {};
+    for (var p = 0; p < validIds.length; p++) picked[validIds[p]] = true;
+    var adjacent = 0;
+    for (var a = 0; a < validIds.length; a++) if (picked[validIds[a] + 1]) adjacent++;
+    if (adjacent > (validIds.length - 1) * MONTAGE_MAX_ADJACENT) return false; // sequencia, nao saltos
+    return true;
   }
 
-  function resolveMontage(m, transcript, idx) {
+  // Duas montagens que compartilham a maioria dos segmentos sao a "mesma variacao"
+  // (temperatura alta ainda pode repetir). Duplicata se sobreposicao > 60%.
+  function segmentsTooSimilar(a, b) {
+    if (!a.length || !b.length) return false;
+    var sb = {}; for (var i = 0; i < b.length; i++) sb[b[i]] = true;
+    var shared = 0, seen = {};
+    for (var j = 0; j < a.length; j++) { if (sb[a[j]] && !seen[a[j]]) { shared++; seen[a[j]] = true; } }
+    return shared / Math.min(a.length, b.length) > 0.6;
+  }
+
+  // Padding ADAPTATIVO por trecho (mesma logica dos silencios): o `end` do Whisper
+  // e o fim do fonema, nao do som audivel. Padding fixo pequeno decepava a ultima
+  // silaba -- e o "come palavras" da montagem. A cauda estende ate a proxima
+  // palavra falada (na linha do tempo), sem invadi-la.
+  function pieceSpan(seg, transcript, wordsSorted, idxByStart) {
+    var w0 = wordById(transcript, seg.word_ids[0]);
+    var w1 = wordById(transcript, seg.word_ids[seg.word_ids.length - 1]);
+    var pad = adaptivePad(w0, w1, wordsSorted, idxByStart);
+    return { start: pad.start, end: pad.end, text: seg.text };
+  }
+
+  function resolveMontage(m, transcript, idx, wordsSorted, idxByStart) {
     var segs = m.segments || [];
     if (!montageIsSpread(segs, transcript)) return null; // grudado numa regiao: nao e frankenbite
     var pieces = [];
     for (var j = 0; j < segs.length; j++) {
       var seg = segById(transcript, segs[j]);
       if (!seg || !seg.word_ids.length) continue;
-      var w0 = wordById(transcript, seg.word_ids[0]);
-      var w1 = wordById(transcript, seg.word_ids[seg.word_ids.length - 1]);
-      if (!w0 || !w1) continue;
-      // texto = texto do segmento (completo), nao reconstrucao das palavras
-      pieces.push({ start: Math.max(0, w0.start - PADDING), end: w1.end + PADDING, text: seg.text });
+      pieces.push(pieceSpan(seg, transcript, wordsSorted, idxByStart));
       if (pieces.length >= 8) break; // teto de seguranca: montagem nunca vira colcha gigante
     }
     if (pieces.length < MONTAGE_MIN_PIECES) return null;
@@ -703,11 +754,14 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
     var apiKey = readOpenAIKey();
     var minDur = opts.minDur || 30;
     var maxDur = opts.maxDur || 90;
-    var sink = { type: "viral", min_dur: minDur, max_dur: maxDur };
-    var user = buildUserPrompt(transcript, opts.minScore || 45, opts.maxClips || 12, minDur, maxDur);
+    var minScore = opts.minScore || 45;
+    var maxClips = opts.maxClips || 12;
+    var sink = { type: "viral", min_dur: minDur, max_dur: maxDur, min_score: minScore, max_clips: maxClips };
+    var user = buildUserPrompt(transcript, minScore, maxClips, minDur, maxDur);
     var out = await gptCall(apiKey, SYSTEM_PROMPT_VIRAL, user, "propose_clips", CLIP_SCHEMA, sink);
-    // enforcement em codigo: a IA nao respeita duracao de forma confiavel
-    var clips = resolveClips(out.clips || [], transcript, minDur, maxDur);
+    // enforcement em codigo: a IA nao respeita duracao/score de forma confiavel.
+    // Espelha _resolve_and_filter (Python): filtra score, faixa de duracao e corta em maxClips.
+    var clips = resolveClips(out.clips || [], transcript, minDur, maxDur, minScore, maxClips);
     var rej = clips._rejected || { curto: 0, longo: 0 };
     sink.rejeitados = rej;
     sink.resolved = clips.map(function (c) { return { titulo: c.titulo, score: c.score, start: c.start, end: c.end, dur: +(c.end - c.start).toFixed(1), text: c.text }; });
@@ -747,15 +801,24 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
       segLines.join("\n") +
       "\n\nCrie montagens costurando segmentos de momentos diferentes numa narrativa nova e mais forte. " +
       "Cada montagem é uma lista ORDENADA de ids (ordem de reprodução). Ordene as montagens por score.";
-    var out = await gptCall(apiKey, SYSTEM_PROMPT_MONTAGE, user, "propose_montages", MONTAGE_SCHEMA, sink);
+    var out = await gptCall(apiKey, SYSTEM_PROMPT_MONTAGE, user, "propose_montages", MONTAGE_SCHEMA, sink, 0.8);
     var raw = out.montagens || [];
+    // pre-computa a lista de palavras ordenada (para o padding adaptativo por trecho)
+    var wordsSorted = transcript.words.slice().sort(function (a, b) { return a.start - b.start; });
+    var idxByStart = {};
+    for (var wi = 0; wi < wordsSorted.length; wi++) idxByStart[wordsSorted[wi].id] = wi;
+
     var montages = [];
+    var keptSegments = [];   // dedup de montagens quase iguais
     var descartadasAgrupadas = 0;
     for (var i = 0; i < raw.length; i++) {
       var segs = raw[i].segments || [];
       if (!montageIsSpread(segs, transcript)) { descartadasAgrupadas++; continue; }
-      var m = resolveMontage(raw[i], transcript, i);
-      if (m) montages.push(m);
+      var dup = false;
+      for (var d = 0; d < keptSegments.length; d++) { if (segmentsTooSimilar(segs, keptSegments[d])) { dup = true; break; } }
+      if (dup) continue;
+      var m = resolveMontage(raw[i], transcript, i, wordsSorted, idxByStart);
+      if (m) { montages.push(m); keptSegments.push(segs); }
     }
     montages.sort(function (a, b) { return b.score - a.score; });
     var valid = montages.length;
@@ -863,6 +926,7 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
     _buildCutPlan: buildCutPlan,
     _resolveClips: resolveClips,
     _montageIsSpread: montageIsSpread,
+    _segmentsTooSimilar: segmentsTooSimilar,
     _MONTAGE_REQUEST_BUFFER: MONTAGE_REQUEST_BUFFER,
     _MONTAGE_REQUEST_CAP: MONTAGE_REQUEST_CAP,
     _secToTicks: secToTicks,
