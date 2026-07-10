@@ -719,39 +719,60 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
 
   var COLOR_NAMES = ["Azul", "Roxo", "Laranja", "Verde", "Rosa", "Ciano", "Amarelo", "Marinho"];
 
+  // Pedir EXATAMENTE o numero de montagens que o usuario quer nao deixa margem:
+  // se a IA propor N e o filtro de espalhamento descartar 1 ou 2 por ficarem
+  // concentradas numa mesma parte do video, sobra menos que o pedido sem chance
+  // de reposicao ("pedi 3, veio 1" -- bug reportado). Pedimos folga.
+  var MONTAGE_REQUEST_BUFFER = 2, MONTAGE_REQUEST_CAP = 10;
+
   async function frankenbite(transcript, source, opts) {
     opts = opts || {};
     var apiKey = readOpenAIKey();
     var nVideos = opts.nVideos || opts.maxClips || 3;   // quantos videos montados o usuario quer
     var minDur = opts.minDur || 30;
     var maxDur = opts.maxDur || 90;
-    var sink = { type: "frankenbite", pedidos: nVideos, min_dur: minDur, max_dur: maxDur };
+    var requestCount = Math.min(nVideos + MONTAGE_REQUEST_BUFFER, MONTAGE_REQUEST_CAP);
+    var sink = { type: "frankenbite", pedidos: nVideos, request_count: requestCount, min_dur: minDur, max_dur: maxDur };
     var segLines = [];
     for (var si = 0; si < transcript.segments.length; si++) {
       var s = transcript.segments[si];
       segLines.push("[seg " + s.id + " | " + s.start.toFixed(1) + "-" + s.end.toFixed(1) + "] " + s.text);
     }
-    var user = "QUANTIDADE DE MONTAGENS PEDIDA: " + nVideos + " (entregue exatamente esse numero se houver material; " +
-      "se nao houver material bom o bastante, entregue menos, nunca mais).\nDURAÇÃO DE CADA MONTAGEM: " +
-      minDur + "-" + maxDur + "s (some as duracoes dos segmentos escolhidos).\n\nTRANSCRIÇÃO (id | tempo | texto):\n" +
+    var user = "GERE " + requestCount + " PROPOSTAS DE MONTAGEM. DURAÇÃO ALVO: " + minDur + "-" + maxDur +
+      "s (some as durações dos segmentos escolhidos).\n\nIMPORTANTE: o sistema descarta automaticamente " +
+      "qualquer proposta cujos segmentos fiquem concentrados numa mesma parte do vídeo (isso NÃO é " +
+      "frankenbite, é corte linear). Por isso peça " + requestCount + " propostas GENUINAMENTE DIFERENTES " +
+      "entre si — não repita o mesmo conjunto de segmentos em duas propostas, e garanta que CADA proposta " +
+      "espalha por começo, meio e fim do vídeo (não só uma delas).\n\nTRANSCRIÇÃO (id | tempo | texto):\n" +
       segLines.join("\n") +
       "\n\nCrie montagens costurando segmentos de momentos diferentes numa narrativa nova e mais forte. " +
       "Cada montagem é uma lista ORDENADA de ids (ordem de reprodução). Ordene as montagens por score.";
     var out = await gptCall(apiKey, SYSTEM_PROMPT_MONTAGE, user, "propose_montages", MONTAGE_SCHEMA, sink);
     var raw = out.montagens || [];
     var montages = [];
-    for (var i = 0; i < raw.length; i++) { var m = resolveMontage(raw[i], transcript, i); if (m) montages.push(m); }
+    var descartadasAgrupadas = 0;
+    for (var i = 0; i < raw.length; i++) {
+      var segs = raw[i].segments || [];
+      if (!montageIsSpread(segs, transcript)) { descartadasAgrupadas++; continue; }
+      var m = resolveMontage(raw[i], transcript, i);
+      if (m) montages.push(m);
+    }
     montages.sort(function (a, b) { return b.score - a.score; });
+    var valid = montages.length;
     montages = montages.slice(0, nVideos);              // respeita a quantidade pedida
     // cada montagem inteira ganha 1 cor propria (usada na timeline e no preview)
     for (var k = 0; k < montages.length; k++) {
       montages[k].color_index = COLOR_CYCLE[k % COLOR_CYCLE.length];
       montages[k].color_name = COLOR_NAMES[k % COLOR_NAMES.length];
     }
+    var meta = {
+      requested: nVideos, suggested: raw.length, valid: valid,
+      delivered: montages.length, descartadas_agrupadas: descartadasAgrupadas
+    };
     sink.resolved = montages.map(function (m) { return { titulo: m.titulo, score: m.score, pieces: m.pieces.length, cor: m.color_name, text: m.text }; });
-    sink.summary = montages.length + "/" + nVideos + " montagens";
+    sink.summary = montages.length + "/" + nVideos + " montagens (sugeridas " + raw.length + ", validas " + valid + ")";
     logObjective(sink);
-    return { montages: montages };
+    return { montages: montages, meta: meta };
   }
 
   function removeSilences(transcript, seq, opts) {
@@ -842,6 +863,8 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
     _buildCutPlan: buildCutPlan,
     _resolveClips: resolveClips,
     _montageIsSpread: montageIsSpread,
+    _MONTAGE_REQUEST_BUFFER: MONTAGE_REQUEST_BUFFER,
+    _MONTAGE_REQUEST_CAP: MONTAGE_REQUEST_CAP,
     _secToTicks: secToTicks,
     _detectSpokenSpans: detectSpokenSpans,
     _readOpenAIKey: readOpenAIKey

@@ -104,4 +104,13 @@ function t(words) {
   assert.strictEqual(kept.length, 1, "fala completa de 20s com min 30 deveria sobreviver (grace)");
 })();
 
-console.log("OK: espelho timeline_map JS (remap + split + buildCutPlan + montagem + grace)");
+// --- montagem: pede folga acima do pedido (bug "pedi 3, veio 1") ---
+(function () {
+  assert.strictEqual(c._MONTAGE_REQUEST_BUFFER, 2, "buffer deveria ser 2 (espelho de core/objectives.py)");
+  var requestCount = Math.min(3 + c._MONTAGE_REQUEST_BUFFER, c._MONTAGE_REQUEST_CAP);
+  assert.strictEqual(requestCount, 5, "pedido de 3 deveria virar 5 candidatas (folga p/ filtro de espalhamento)");
+  var capped = Math.min(9 + c._MONTAGE_REQUEST_BUFFER, c._MONTAGE_REQUEST_CAP);
+  assert.strictEqual(capped, 10, "buffer nao deveria estourar o teto");
+})();
+
+console.log("OK: espelho timeline_map JS (remap + split + buildCutPlan + montagem + grace + folga)");

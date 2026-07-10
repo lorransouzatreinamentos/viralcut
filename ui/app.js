@@ -164,7 +164,7 @@ async function runObjective(name) {
       currentData = IS_PREMIERE
         ? await core().frankenbite(transcript, window.__seq, o)
         : await api("/davinci/frankenbite", { method: "POST", body: { n_videos: o.nVideos, min_dur: o.minDur, max_dur: o.maxDur } });
-      renderMontages(currentData.montages, o);
+      renderMontages(currentData.montages, o, currentData.meta);
     } else {
       currentData = IS_PREMIERE
         ? core().removeSilences(transcript, window.__seq, o)
@@ -204,10 +204,16 @@ function renderClips(clips, rejected, o) {
   $("btnApply").textContent = "Aplicar cortes selecionados";
 }
 
-function renderMontages(montages, o) {
+function renderMontages(montages, o, meta) {
   if (!montages.length) return msg($("results"), "Nenhuma montagem gerada. Tente ampliar a faixa de duração.", "err");
-  const pedido = o && o.nVideos;
-  const aviso = pedido && montages.length < pedido
+  const pedido = (meta && meta.requested) ?? (o && o.nVideos);
+  // Transparência: mostra o funil (pedidas → sugeridas pela IA → válidas →
+  // entregues) em vez de só entregar menos que o pedido em silêncio.
+  const aviso = meta && meta.delivered < meta.requested
+    ? `<div class="dim" style="margin-bottom:6px;">Você pediu ${meta.requested} — a IA sugeriu ${meta.suggested}` +
+      (meta.descartadas_agrupadas ? `, mas ${meta.descartadas_agrupadas} ficaram concentradas numa mesma parte do vídeo (não é frankenbite de verdade) e foram descartadas` : "") +
+      `. Entregamos ${meta.delivered}.</div>`
+    : pedido && montages.length < pedido
     ? `<div class="dim" style="margin-bottom:6px;">Você pediu ${pedido}, mas o vídeo só rendeu ${montages.length} montagem(ns) com material bom.</div>`
     : "";
   // Cada montagem marcada = 1 nova timeline, cada uma com sua cor.

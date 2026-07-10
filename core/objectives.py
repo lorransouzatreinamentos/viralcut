@@ -64,21 +64,26 @@ MONTAGE_SCHEMA = {
 }
 
 
-def _build_montage_prompt(transcript: TranscriptState, max_montages: int, min_dur: float, max_dur: float) -> str:
+def _build_montage_prompt(transcript: TranscriptState, request_count: int, min_dur: float, max_dur: float) -> str:
     lines = [f"[seg {s.id} | {s.start:.1f}-{s.end:.1f}] {s.text}" for s in transcript.segments]
     return (
-        f"MAX MONTAGENS: {max_montages}. DURACAO ALVO: {min_dur:.0f}-{max_dur:.0f}s.\n\n"
+        f"GERE {request_count} PROPOSTAS DE MONTAGEM. DURACAO ALVO: {min_dur:.0f}-{max_dur:.0f}s.\n\n"
+        f"IMPORTANTE: o sistema descarta automaticamente qualquer proposta cujos segmentos fiquem "
+        f"concentrados numa mesma parte do video (isso NAO e frankenbite, e corte linear). Por isso "
+        f"peca {request_count} propostas GENUINAMENTE DIFERENTES entre si -- nao repita o mesmo "
+        f"conjunto de segmentos em duas propostas, e garanta que CADA proposta espalha por comeco, "
+        f"meio e fim do video (nao so uma delas).\n\n"
         f"TRANSCRICAO (id | tempo | texto):\n" + "\n".join(lines) +
         "\n\nCrie montagens costurando segmentos de momentos diferentes numa narrativa nova e mais forte. "
         "Cada montagem e uma lista ORDENADA de ids (ordem de reproducao). Ordene por score."
     )
 
 
-async def _call_openai_montage(transcript: TranscriptState, max_montages: int, min_dur: float, max_dur: float) -> dict:
+async def _call_openai_montage(transcript: TranscriptState, request_count: int, min_dur: float, max_dur: float) -> dict:
     if not settings.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY nao configurada")
     model = settings.llm_model if settings.llm_provider == "openai" else "gpt-4o"
-    user = _build_montage_prompt(transcript, max_montages, min_dur, max_dur)
+    user = _build_montage_prompt(transcript, request_count, min_dur, max_dur)
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
             OPENAI_URL,
@@ -163,12 +168,36 @@ def _resolve_montages(raw: dict, transcript: TranscriptState) -> tuple[list[dict
     return montages, rejeitadas_agrupadas
 
 
-async def extract_montages(transcript: TranscriptState, max_montages: int = 3, min_dur: float = 15, max_dur: float = 90) -> list[dict]:
+# Pedir EXATAMENTE o numero de montagens que o usuario quer nao deixa margem: se
+# a IA propor N e o filtro de espalhamento (MONTAGE_MIN_SPREAD) descartar 1 ou 2
+# por ficarem concentradas numa mesma parte do video, sobra menos que o pedido
+# sem chance de reposicao. Pedimos folga -- a IA gera mais candidatas do que o
+# necessario, o codigo filtra e entrega as melhores ate o numero pedido.
+MONTAGE_REQUEST_BUFFER = 2
+MONTAGE_REQUEST_CAP = 10
+
+
+async def extract_montages(
+    transcript: TranscriptState, max_montages: int = 3, min_dur: float = 15, max_dur: float = 90,
+) -> tuple[list[dict], dict]:
+    """Retorna (montagens_entregues, meta). meta expoe QUANTO foi pedido vs
+    sugerido vs valido vs entregue -- para a UI explicar por que veio menos que
+    o pedido, em vez de simplesmente entregar menos em silencio."""
     if not transcript.segments:
-        return []
-    raw = await _call_openai_montage(transcript, max_montages, min_dur, max_dur)
-    montages, _rejeitadas = _resolve_montages(raw, transcript)
-    return montages
+        return [], {"requested": max_montages, "suggested": 0, "valid": 0, "delivered": 0, "descartadas_agrupadas": 0}
+
+    request_count = min(max_montages + MONTAGE_REQUEST_BUFFER, MONTAGE_REQUEST_CAP)
+    raw = await _call_openai_montage(transcript, request_count, min_dur, max_dur)
+    montages, descartadas_agrupadas = _resolve_montages(raw, transcript)
+    delivered = montages[:max_montages]
+    meta = {
+        "requested": max_montages,
+        "suggested": len(raw.get("montagens", [])),
+        "valid": len(montages),
+        "delivered": len(delivered),
+        "descartadas_agrupadas": descartadas_agrupadas,
+    }
+    return delivered, meta
 
 
 # ---------------------------------------------------------------------------

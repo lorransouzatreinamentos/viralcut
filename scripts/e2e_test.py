@@ -11,12 +11,12 @@ from core.viral import extract_viral_clips
 async def main(audio_path: str):
     tmp = tempfile.mkdtemp(prefix="viralcut_e2e_")
     print(f"[1/2] Transcrevendo {audio_path} via Whisper…")
-    transcript = await transcribe_timeline_audio(audio_path, tmp, language="pt")
+    transcript, _meta = await transcribe_timeline_audio(audio_path, tmp, language="pt")
     print(f"  -> {len(transcript.words)} palavras, {len(transcript.segments)} segmentos")
     print(f"  primeiras palavras: {' '.join(w.text for w in transcript.words[:12])}…")
 
     print("\n[2/2] Extraindo cortes virais via GPT…")
-    clips = await extract_viral_clips(transcript, min_score=40, max_clips=6, min_dur=8, max_dur=40)
+    clips, _rejected = await extract_viral_clips(transcript, min_score=40, max_clips=6, min_dur=8, max_dur=40)
     print(f"  -> {len(clips)} cortes\n")
 
     for c in clips:

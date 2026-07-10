@@ -501,18 +501,17 @@ async def dv_frankenbite(req: DvMontageRequest | None = None):
     req = req or DvMontageRequest()
     transcript = _require_transcript()
     try:
-        montages = await extract_montages(
+        montages, meta = await extract_montages(
             transcript, max_montages=req.n_videos, min_dur=req.min_dur, max_dur=req.max_dur,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
-    montages = montages[: req.n_videos]
     # cada montagem inteira ganha 1 cor propria (video montado = 1 cor)
     for i, m in enumerate(montages):
         m["color"] = _DAVINCI_COLORS[i % len(_DAVINCI_COLORS)]
     _dv["montages"] = montages
     _dv_log()
-    return {"montages": montages}
+    return {"montages": montages, "meta": meta}
 
 
 @app.post("/davinci/silences")

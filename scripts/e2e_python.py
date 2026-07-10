@@ -11,16 +11,17 @@ from core.objectives import extract_montages, remove_silences
 async def main(audio: str):
     tmp = tempfile.mkdtemp()
     print("[1] Transcrevendo…")
-    t = await transcribe_timeline_audio(audio, tmp, language="pt")
+    t, _meta = await transcribe_timeline_audio(audio, tmp, language="pt")
     print(f"    {len(t.words)} palavras, {len(t.segments)} segmentos")
 
     print("[2] Falas virais…")
-    clips = await extract_viral_clips(t, min_score=40, max_clips=6, min_dur=8, max_dur=40)
+    clips, _rejected = await extract_viral_clips(t, min_score=40, max_clips=6, min_dur=8, max_dur=40)
     for c in clips:
         print(f"    [{c.score}] {c.titulo} ({c.start:.1f}-{c.end:.1f}s)")
 
     print("[3] Montar falas…")
-    montages = await extract_montages(t, max_montages=3, min_dur=8, max_dur=40)
+    montages, meta = await extract_montages(t, max_montages=3, min_dur=8, max_dur=40)
+    print(f"    pedido {meta['requested']} | sugeridas {meta['suggested']} | validas {meta['valid']} | entregues {meta['delivered']}")
     for m in montages:
         print(f"    [{m['score']}] {m['titulo']} — {len(m['pieces'])} trechos")
 
