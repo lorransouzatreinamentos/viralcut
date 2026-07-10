@@ -1,1 +1,0 @@
-window.__VIRALCUT_VERSION = "V.10.07.26.13.43";

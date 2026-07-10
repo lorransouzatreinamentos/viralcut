@@ -7,3 +7,11 @@ node_modules/
 dist/
 *.zxp
 logs/
+
+# Gerados por scripts/install-premiere.sh / install-windows.ps1 a cada instalacao
+# (versao com timestamp novo, copia de ui/app.js). Rastrear isso no git sujava a
+# arvore a cada install e quebrava o proximo "git pull" do botao Atualizar.
+premiere-panel/client/app.js
+premiere-panel/client/version.js
+premiere-panel/host/version.jsx
+premiere-panel/host/bundle.jsx

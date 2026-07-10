@@ -48,6 +48,22 @@
     path.join(__dirname, "host", "local_transcribe.py"),        // se __dirname = raiz da extensao
     "/Applications/CLAUDE CODE/Projetos/VIRALCUT/premiere-panel/host/local_transcribe.py" // legado (Mac do dono)
   ];
+  // Raiz do repo (onde vive scripts/install-premiere.sh e o .git). MESMO problema
+  // de __dirname nao confiavel dentro do CEP -- por isso os mesmos candidatos,
+  // um nivel acima (premiere-panel/host/../.. = raiz do repo).
+  var REPO_ROOT_CANDIDATES = [
+    path.join(HOME, "viralcut"),
+    path.join(__dirname, "..", ".."),       // se __dirname = client/
+    path.join(__dirname, ".."),             // se __dirname = raiz da extensao
+    "/Applications/CLAUDE CODE/Projetos/VIRALCUT" // legado (Mac do dono)
+  ];
+  function findRepoRoot() {
+    for (var i = 0; i < REPO_ROOT_CANDIDATES.length; i++) {
+      try { if (fs.existsSync(path.join(REPO_ROOT_CANDIDATES[i], ".git"))) return REPO_ROOT_CANDIDATES[i]; } catch (e) {}
+    }
+    return null;
+  }
+
   function findLocalTranscribeScript() {
     for (var i = 0; i < LOCAL_TRANSCRIBE_CANDIDATES.length; i++) {
       try { if (fs.existsSync(LOCAL_TRANSCRIBE_CANDIDATES[i])) return LOCAL_TRANSCRIBE_CANDIDATES[i]; } catch (e) {}
@@ -770,14 +786,25 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
     }
   }
 
-  // Atualiza o painel: roda o install script via Node (sem depender de servidor).
+  // Atualiza o painel: PUXA do git (repo em ~/viralcut, o instalador clona ali) e
+  // depois resincroniza o painel CEP com o que acabou de chegar.
+  // ANTES: so resincronizava a copia local, sem git pull, e usava caminho fixo
+  // do Mac do dono -- em qualquer outra maquina o botao nao atualizava nada.
   function updatePanel() {
     return new Promise(function (resolve, reject) {
-      var script = "/Applications/CLAUDE CODE/Projetos/VIRALCUT/scripts/install-premiere.sh";
-      childProcess.execFile("bash", [script], { timeout: 60000 }, function (err, stdout, stderr) {
-        if (err) return reject(new Error("update falhou: " + (stderr || err.message).slice(-300)));
-        resolve(String(stdout).trim());
-      });
+      var root = findRepoRoot();
+      if (!root) return reject(new Error(
+        "Repositorio nao encontrado. Rode o instalador (install-mac.sh / install-windows.ps1)."
+      ));
+      childProcess.execFile("git", ["pull", "--ff-only"], { cwd: root, timeout: 30000 },
+        function (errPull, _out, errPullStderr) {
+          if (errPull) return reject(new Error("git pull falhou: " + (errPullStderr || errPull.message).slice(-300)));
+          var script = path.join(root, "scripts", "install-premiere.sh");
+          childProcess.execFile("bash", [script], { timeout: 60000 }, function (err, stdout, stderr) {
+            if (err) return reject(new Error("update falhou: " + (stderr || err.message).slice(-300)));
+            resolve(String(stdout).trim());
+          });
+        });
     });
   }
 

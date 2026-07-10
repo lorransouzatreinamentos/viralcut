@@ -1,1 +1,0 @@
-var VIRALCUT_BUILD = "V.10.07.26.13.43";
