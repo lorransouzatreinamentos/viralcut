@@ -75,17 +75,40 @@ def test_cut_in_gap_is_skipped_with_warning():
     assert "no vazio" in warnings[0]
 
 
-def test_cut_crossing_boundary_is_clamped():
-    """Item vai ate frame 600. Corte 15s-25s (450-750) deve grampear o fim em 600."""
+def test_cut_past_end_of_only_clip_truncates():
+    """Item unico vai ate frame 600. Corte 15s-25s (450-750) sem midia depois:
+    o span so cobre 450-600 (nao ha o que cortar depois). Sem warning de grampe."""
     items = [TimelineItemDesc(start=0, end=600, left_offset=0, media_pool_item="M")]
-    clips = [_clip(15.0, 25.0, titulo="cruza")]
+    clips = [_clip(15.0, 25.0, titulo="passa do fim")]
 
     infos, warnings = build_clip_infos(clips, items, timeline_start_frame=0, fps=30.0)
 
     assert len(infos) == 1
     assert infos[0]["startFrame"] == 450
-    assert infos[0]["endFrame"] == 600           # grampeado (nao 750)
-    assert any("grampeado" in w for w in warnings)
+    assert infos[0]["endFrame"] == 600
+
+
+def test_cut_crossing_two_videos_splits_into_two():
+    """O bug reportado: corte que cruza a edicao entre 2 videos vira 2 spans,
+    cada um na sua fonte, ambos com a cor/id do corte."""
+    items = [
+        TimelineItemDesc(start=0, end=600, left_offset=0, media_pool_item="VIDEO_A"),
+        TimelineItemDesc(start=600, end=1200, left_offset=100, media_pool_item="VIDEO_B"),
+    ]
+    clips = [_clip(15.0, 25.0, titulo="cruza", cid="x", color="Pink")]  # 450-750 na timeline
+
+    infos, warnings = build_clip_infos(clips, items, timeline_start_frame=0, fps=30.0)
+
+    assert len(infos) == 2, "corte que cruza fronteira deveria virar 2 spans"
+    # span 1: video A, timeline 450-600 -> origem 450-600 (left_offset 0)
+    assert infos[0]["mediaPoolItem"] == "VIDEO_A"
+    assert infos[0]["startFrame"] == 450 and infos[0]["endFrame"] == 600
+    # span 2: video B, timeline 600-750 -> origem 100+(600-600)=100 ate 100+150=250
+    assert infos[1]["mediaPoolItem"] == "VIDEO_B"
+    assert infos[1]["startFrame"] == 100 and infos[1]["endFrame"] == 250
+    # os dois pedacos herdam a mesma cor e id do corte
+    assert infos[0]["_color"] == infos[1]["_color"] == "Pink"
+    assert infos[0]["_clip_id"] == infos[1]["_clip_id"] == "x"
 
 
 def test_item_without_media_is_skipped():

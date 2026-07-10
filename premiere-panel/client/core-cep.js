@@ -377,18 +377,31 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
     return frameToTicks(Math.round(sec * fps), fps);
   }
 
-  function buildCutPlan(clips, source, seqName) {
+  // Expande UM corte (tempo de timeline) nos subclipes que ele atravessa. Um
+  // corte dentro de 1 video -> 1 subclip; cruzando a edicao -> N, mesma cor.
+  // seq.clips vem de getTimelineClips (todos os videos da timeline).
+  function spansToCuts(cutStart, cutEnd, seq, idBase, titulo, labelIndex) {
+    var spans = splitCut(cutStart, cutEnd, seq.clips);
     var cuts = [];
-    for (var i = 0; i < clips.length; i++) {
-      var c = clips[i];
+    for (var s = 0; s < spans.length; s++) {
+      var sp = spans[s];
       cuts.push({
-        id: c.id,
-        titulo: c.titulo,
-        project_item_id: source.project_item_id,
-        in_ticks: secToTicksIn(c.start, source.fps),
-        out_ticks: secToTicksOut(c.end, source.fps),
-        label_index: c.color_index
+        id: idBase + (spans.length > 1 ? "_" + s : ""),
+        titulo: titulo,
+        project_item_id: sp.ref,
+        in_ticks: secToTicksIn(sp.src_start, seq.fps),
+        out_ticks: secToTicksOut(sp.src_end, seq.fps),
+        label_index: labelIndex
       });
+    }
+    return cuts;
+  }
+
+  function buildCutPlan(cortes, seq, seqName) {
+    var cuts = [];
+    for (var i = 0; i < cortes.length; i++) {
+      var c = cortes[i];
+      cuts = cuts.concat(spansToCuts(c.start, c.end, seq, c.id, c.titulo, c.color_index));
     }
     return { new_sequence_name: seqName, cuts: cuts };
   }
@@ -465,20 +478,14 @@ A montagem tem que soar como UMA fala contínua e proposital.
   // montagens diferentes usam cores diferentes. Usa a cor ja atribuida na
   // montagem (frankenbite) para que preview e timeline batam -- o indice da
   // lista SELECIONADA nao corresponde ao da lista completa.
-  function buildMontagePlan(montage, source, seqName, montageIndex) {
+  function buildMontagePlan(montage, seq, seqName, montageIndex) {
     var color = typeof montage.color_index === "number"
       ? montage.color_index
       : COLOR_CYCLE[(montageIndex || 0) % COLOR_CYCLE.length];
     var cuts = [];
     for (var i = 0; i < montage.pieces.length; i++) {
       var p = montage.pieces[i];
-      cuts.push({
-        id: montage.id + "_" + i, titulo: montage.titulo,
-        project_item_id: source.project_item_id,
-        in_ticks: secToTicksIn(p.start, source.fps),
-        out_ticks: secToTicksOut(p.end, source.fps),
-        label_index: color
-      });
+      cuts = cuts.concat(spansToCuts(p.start, p.end, seq, montage.id + "_" + i, montage.titulo, color));
     }
     return { new_sequence_name: seqName, cuts: cuts };
   }
@@ -527,44 +534,117 @@ A montagem tem que soar como UMA fala contínua e proposital.
   }
 
   // ===========================================================================
-  // ORQUESTRACAO PUBLICA
+  // TIMELINE <-> ORIGEM (espelho de core/timeline_map.py — manter em sincronia)
+  // Uma timeline tem varios videos; transcrevemos cada ARQUIVO (cache por arquivo)
+  // e costuramos em tempo de timeline. Sem isto, o painel so via o 1o video.
   // ===========================================================================
-  /** force=true: usuario clicou "Transcrever novamente" (mudou a mídia). */
-  async function transcribe(source, onProgress, force) {
-    onProgress = onProgress || function () {};
-    logReset(source);
+  var _EDGE_TOL = 0.05;
 
-    var engine = "local (faster-whisper)";
-    var cached = false;
-    var transcript = null;
-
-    if (!force) {
-      var hit = cacheLoad(source.path, "pt");
-      if (hit) {
-        transcript = { words: hit.words, segments: hit.segments };
-        engine = hit.engine || "?";
-        cached = true;
-        onProgress(90, "Transcrição em cache (" + (hit.created_at || "") + ")");
+  function remapToTimeline(tlClips, transcripts) {
+    var outWords = [], outSegments = [];
+    var ordered = tlClips.slice().sort(function (a, b) { return a.tl_start - b.tl_start; });
+    for (var ci = 0; ci < ordered.length; ci++) {
+      var clip = ordered[ci];
+      var t = transcripts[clip.source_key];
+      if (!t || !t.segments.length) continue;
+      var srcOut = clip.src_in + (clip.tl_end - clip.tl_start);
+      var lo = clip.src_in - _EDGE_TOL, hi = srcOut + _EDGE_TOL;
+      var shift = clip.tl_start - clip.src_in; // t_timeline = t_origem + shift
+      var map = {};
+      for (var wi = 0; wi < t.words.length; wi++) {
+        var w = t.words[wi];
+        if (w.end <= lo || w.start >= hi) continue;
+        var nid = outWords.length;
+        map[w.id] = nid;
+        var ns = Math.max(0, w.start + shift), ne = w.end + shift;
+        if (ne <= ns) ne = ns + 0.01;
+        outWords.push({ id: nid, text: w.text, start: ns, end: ne });
+      }
+      for (var si = 0; si < t.segments.length; si++) {
+        var s = t.segments[si], kept = [];
+        for (var k = 0; k < s.word_ids.length; k++) {
+          if (s.word_ids[k] in map) kept.push(map[s.word_ids[k]]);
+        }
+        if (!kept.length) continue;
+        var a = Infinity, b = -Infinity;
+        for (var kk = 0; kk < kept.length; kk++) {
+          var ww = outWords[kept[kk]];
+          if (ww.start < a) a = ww.start;
+          if (ww.end > b) b = ww.end;
+        }
+        if (b <= a) b = a + 0.01;
+        outSegments.push({ id: outSegments.length, start: a, end: b, text: s.text, word_ids: kept });
       }
     }
+    return { words: outWords, segments: outSegments };
+  }
 
-    if (!transcript) {
-      onProgress(15, "Transcrevendo no seu computador…");
-      transcript = await transcribeLocal(source.path, "pt");
-      cacheSave(source.path, "pt", transcript, engine);
+  /** Corte [cutStart,cutEnd] em tempo de timeline -> spans em tempo de origem, um
+   *  por clipe atravessado. Corte que cruza edicao entre videos vira N spans. */
+  function splitCut(cutStart, cutEnd, tlClips) {
+    var spans = [];
+    var ordered = tlClips.slice().sort(function (a, b) { return a.tl_start - b.tl_start; });
+    for (var i = 0; i < ordered.length; i++) {
+      var clip = ordered[i];
+      var ss = Math.max(cutStart, clip.tl_start);
+      var se = Math.min(cutEnd, clip.tl_end);
+      if (se <= ss) continue;
+      spans.push({
+        ref: clip.ref, source_key: clip.source_key,
+        src_start: clip.src_in + (ss - clip.tl_start),
+        src_end: clip.src_in + (se - clip.tl_start),
+        tl_start: ss
+      });
+    }
+    return spans;
+  }
+
+  // ===========================================================================
+  // ORQUESTRACAO PUBLICA
+  // ===========================================================================
+  /** Transcreve TODOS os videos da timeline (seq.clips) e costura em tempo de
+   *  timeline. Cada arquivo e transcrito 1x (cache por arquivo).
+   *  force=true: "Transcrever novamente" (mudou a mídia). */
+  async function transcribe(seq, onProgress, force) {
+    onProgress = onProgress || function () {};
+    logReset(seq);
+
+    var sources = [];
+    for (var i = 0; i < seq.clips.length; i++) {
+      if (sources.indexOf(seq.clips[i].source_key) < 0) sources.push(seq.clips[i].source_key);
+    }
+    if (!sources.length) throw new Error("A timeline não tem nenhum vídeo para transcrever.");
+
+    var transcripts = {}, anyCached = false, engine = "local (faster-whisper)";
+    for (var si = 0; si < sources.length; si++) {
+      var path = sources[si];
+      var t = null, cached = false, pct = 10 + Math.round(80 * si / sources.length);
+      if (!force) {
+        var hit = cacheLoad(path, "pt");
+        if (hit) { t = { words: hit.words, segments: hit.segments }; engine = hit.engine || engine; cached = true; }
+      }
+      if (!t) {
+        onProgress(pct, "Transcrevendo vídeo " + (si + 1) + "/" + sources.length + "…");
+        t = await transcribeLocal(path, "pt");
+        cacheSave(path, "pt", t, engine);
+      } else {
+        onProgress(pct, "Vídeo " + (si + 1) + "/" + sources.length + " (cache)");
+      }
+      transcripts[path] = t;
+      anyCached = anyCached || cached;
     }
 
-    if (!transcript.segments.length) throw new Error("Nenhuma fala detectada no vídeo.");
+    var transcript = remapToTimeline(seq.clips, transcripts);
+    if (!transcript.segments.length) throw new Error("Nenhuma fala detectada nos vídeos da timeline.");
 
     logSet("whisper", {
-      engine: engine,
-      cached: cached,
-      words: transcript.words.length,
-      segments: transcript.segments.length,
+      engine: engine, cached: anyCached, sources: sources.length,
+      words: transcript.words.length, segments: transcript.segments.length,
       full_text: transcript.segments.map(function (s) { return s.text; }).join(" ")
     });
-    onProgress(100, transcript.words.length + " palavras (" + (cached ? "cache" : "local") + ")");
-    transcript.__cached = cached;
+    onProgress(100, transcript.words.length + " palavras, " + sources.length + " vídeo(s)" +
+      (anyCached ? " (cache)" : ""));
+    transcript.__cached = anyCached;
     return transcript;
   }
 
@@ -624,27 +704,21 @@ A montagem tem que soar como UMA fala contínua e proposital.
     return { montages: montages };
   }
 
-  function removeSilences(transcript, source, opts) {
+  function removeSilences(transcript, seq, opts) {
     opts = opts || {};
     var gap = opts.gap || 0.6;
     var rawSpans = detectSpokenSpans(transcript, gap);
-    var spans = padSpans(rawSpans, source.duration_sec);
+    var spans = padSpans(rawSpans, seq.duration_sec);
     var cuts = [];
     var kept = 0;
     for (var i = 0; i < spans.length; i++) {
       var s = spans[i];
-      var st = s.start, en = s.end;
-      kept += (en - st);
-      cuts.push({
-        id: "sil_" + i, titulo: "Fala " + (i + 1),
-        project_item_id: source.project_item_id,
-        in_ticks: secToTicksIn(st, source.fps),
-        out_ticks: secToTicksOut(en, source.fps),
-        label_index: 4
-      });
+      kept += (s.end - s.start);
+      // cada fala (tempo de timeline) e dividida pelos videos que ela cobre
+      cuts = cuts.concat(spansToCuts(s.start, s.end, seq, "sil_" + i, "Fala " + (i + 1), 4));
     }
-    var original = source.duration_sec || (transcript.words.length ? transcript.words[transcript.words.length - 1].end : kept);
-    var plan = { new_sequence_name: "Sem silêncios — " + (source.name || "sequencia"), cuts: cuts };
+    var original = seq.duration_sec || (transcript.words.length ? transcript.words[transcript.words.length - 1].end : kept);
+    var plan = { new_sequence_name: "Sem silêncios — " + (seq.name || "sequencia"), cuts: cuts };
     var summary = {
       spans: spans.length, original_sec: original, new_sec: kept, saved_sec: Math.max(0, original - kept),
       gap_threshold: gap
@@ -685,6 +759,9 @@ A montagem tem que soar como UMA fala contínua e proposital.
     updatePanel: updatePanel,
     // expostos para teste
     _cacheFingerprint: cacheFingerprint,
+    _remapToTimeline: remapToTimeline,
+    _splitCut: splitCut,
+    _buildCutPlan: buildCutPlan,
     _resolveClips: resolveClips,
     _secToTicks: secToTicks,
     _detectSpokenSpans: detectSpokenSpans,

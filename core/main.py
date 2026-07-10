@@ -1,7 +1,6 @@
 """Core Engine — servidor local do VIRALCUT (ver PLANO_MESTRE.md secao 8)."""
 import asyncio
 import json
-import math
 import os
 import tempfile
 import uuid
@@ -16,6 +15,7 @@ from core.adapters import davinci
 from core.adapters.premiere_plan import SeqItemDesc, build_cut_plan
 from core.config import settings
 from core.objectives import extract_montages, remove_silences
+from core.timeline_map import TimelineClip, remap_to_timeline
 from core.transcribe import transcribe_timeline_audio
 from core.viral import extract_viral_clips
 
@@ -34,7 +34,9 @@ _jobs: dict[str, dict] = {}
 _state: dict = {"timeline": None, "transcript": None, "clips": {}, "premiere_source": None}
 
 # Estado + log do fluxo DaVinci (browser UI -> Core Python -> Resolve)
-_dv: dict = {"source": None, "transcript": None, "viral": [], "montages": [], "silences": None}
+# "timeline": info da timeline aberta (nome, fps, duracao). "clips": TODOS os
+# clipes de video dela (o app transcreve a fala inteira, nao so o 1o video).
+_dv: dict = {"timeline": None, "clips": [], "transcript": None, "viral": [], "montages": [], "silences": None}
 _LOG_DIR = Path.home() / ".viralcut" / "logs"
 
 
@@ -43,7 +45,8 @@ def _dv_log():
         _LOG_DIR.mkdir(parents=True, exist_ok=True)
         snapshot = {
             "host": "davinci",
-            "source": _dv["source"],
+            "timeline": _dv["timeline"],
+            "clips": len(_dv["clips"]),
             "whisper": (
                 {"words": len(_dv["transcript"].words), "segments": len(_dv["transcript"].segments),
                  "full_text": " ".join(s.text for s in _dv["transcript"].segments)}
@@ -390,15 +393,24 @@ async def apply(req: ApplyRequest):
 @app.post("/davinci/select")
 async def dv_select():
     try:
-        info = await asyncio.to_thread(davinci.get_source_media_path)
+        info = await asyncio.to_thread(davinci.list_timeline_clips)
     except RuntimeError as e:
         # grava a falha no log tambem -- antes so o sucesso era registrado, o que
         # deixava a depuracao remota (maquina do usuario) as cegas
         _dv_log_error("select", str(e))
         raise HTTPException(status_code=400, detail=str(e)) from e
-    _dv.update({"source": info, "transcript": None, "viral": [], "montages": [], "silences": None})
+    _dv.update({
+        "timeline": {"timeline_name": info["timeline_name"], "fps": info["fps"],
+                     "duration_sec": info["duration_sec"], "name": info["timeline_name"]},
+        "clips": info["clips"],
+        "transcript": None, "viral": [], "montages": [], "silences": None,
+    })
     _dv_log()
-    return info
+    # A UI mostra "Timeline: X" e "N videos". name = timeline (compat com a UI atual).
+    return {
+        "timeline_name": info["timeline_name"], "name": info["timeline_name"],
+        "duration_sec": info["duration_sec"], "n_clips": len(info["clips"]),
+    }
 
 
 class DvTranscribeRequest(BaseModel):
@@ -407,22 +419,41 @@ class DvTranscribeRequest(BaseModel):
 
 @app.post("/davinci/transcribe")
 async def dv_transcribe(req: DvTranscribeRequest | None = None):
-    if _dv["source"] is None:
+    if not _dv["clips"]:
         raise HTTPException(status_code=400, detail="Selecione a timeline primeiro.")
-    path = _dv["source"]["path"]
-    if not os.path.exists(path):
-        raise HTTPException(status_code=400, detail=f"Arquivo de origem nao encontrado: {path}")
     force = bool(req and req.force)
+
+    clip_meta = _dv["clips"]
+    sources = list(dict.fromkeys(c["source_key"] for c in clip_meta))  # paths unicos, em ordem
+    faltando = [p for p in sources if not os.path.exists(p)]
+    if faltando:
+        raise HTTPException(status_code=400, detail=f"Arquivo(s) de origem nao encontrado(s): {faltando[0]}")
+
+    # Transcreve cada ARQUIVO uma vez (cache por arquivo reaproveita entre timelines
+    # e entre execucoes). Depois remapeia tudo para tempo de timeline.
+    transcripts, any_cached, engine = {}, False, "?"
     try:
-        transcript, meta = await transcribe_timeline_audio(path, str(TMP_DIR), language="pt", force=force)
+        for path in sources:
+            t, meta = await transcribe_timeline_audio(path, str(TMP_DIR), language="pt", force=force)
+            transcripts[path] = t
+            any_cached = any_cached or meta.get("cached", False)
+            engine = meta.get("engine", engine)
     except Exception as e:  # noqa: BLE001
         _dv_log_error("transcribe", str(e))
         raise HTTPException(status_code=502, detail=f"Falha na transcricao: {e}") from e
+
+    clips = [TimelineClip(source_key=c["source_key"], ref=c["source_key"],
+                          src_in=c["src_in"], tl_start=c["tl_start"], tl_end=c["tl_end"],
+                          name=c.get("name", "")) for c in clip_meta]
+    transcript = remap_to_timeline(clips, transcripts)
     if not transcript.segments:
-        raise HTTPException(status_code=400, detail="Nenhuma fala detectada no video.")
+        raise HTTPException(status_code=400, detail="Nenhuma fala detectada nos videos da timeline.")
     _dv["transcript"] = transcript
     _dv_log()
-    return {"words": len(transcript.words), "segments": len(transcript.segments), **meta}
+    return {
+        "words": len(transcript.words), "segments": len(transcript.segments),
+        "sources": len(sources), "cached": any_cached, "engine": engine,
+    }
 
 
 def _require_transcript():
@@ -487,7 +518,7 @@ async def dv_frankenbite(req: DvMontageRequest | None = None):
 @app.post("/davinci/silences")
 async def dv_silences():
     transcript = _require_transcript()
-    dur = _dv["source"]["duration_sec"] if _dv["source"] else 0.0
+    dur = _dv["timeline"]["duration_sec"] if _dv["timeline"] else 0.0
     result = remove_silences(transcript, duration_sec=dur)
     _dv["silences"] = {k: v for k, v in result.items() if k != "cuts"}
     _dv_log()
@@ -501,64 +532,35 @@ class DvApplyRequest(BaseModel):
 
 @app.post("/davinci/apply")
 async def dv_apply(req: DvApplyRequest):
-    src_name = _dv["source"]["name"] if _dv["source"] else "sequencia"
+    # Cortes agora vem em tempo de TIMELINE; apply_timeline_cuts re-le a timeline e
+    # divide cada corte pelos videos que ele atravessa (build_clip_infos com split).
+    src_name = _dv["timeline"]["name"] if _dv["timeline"] else "timeline"
     try:
         if req.objective == "viral":
             sel = [c for c in _dv["viral"] if req.ids is None or c.id in req.ids]
             if not sel:
                 raise HTTPException(status_code=400, detail="Nenhum corte selecionado.")
-            cuts = [{"start": c.start, "end": c.end} for c in sel]
-            colors = [c.color for c in sel]
-            # aplica com cores por corte
-            result = await asyncio.to_thread(_dv_apply_colored, cuts, colors, f"Cortes Virais — {src_name}")
+            cuts = [{"start": c.start, "end": c.end, "color": c.color, "titulo": c.titulo, "id": c.id} for c in sel]
+            result = await asyncio.to_thread(davinci.apply_timeline_cuts, cuts, f"Cortes Virais — {src_name}")
         elif req.objective == "frankenbite":
             sel = [m for m in _dv["montages"] if req.ids is None or m["id"] in req.ids]
             if not sel:
                 raise HTTPException(status_code=400, detail="Nenhuma montagem selecionada.")
             created = 0
             for i, m in enumerate(sel):
-                cuts = [{"start": p["start"], "end": p["end"]} for p in m["pieces"]]
-                # cada montagem inteira em UMA cor propria (nao mais "Purple" fixo).
-                # a cor vem da montagem (atribuida em /davinci/frankenbite), para
-                # que preview e timeline batam mesmo com selecao parcial.
                 color = m.get("color") or _DAVINCI_COLORS[i % len(_DAVINCI_COLORS)]
-                await asyncio.to_thread(davinci.apply_source_cuts, cuts, f"Montagem {i+1} — {src_name}", color)
+                # cada montagem inteira em UMA cor propria; pieces em tempo de timeline
+                cuts = [{"start": p["start"], "end": p["end"], "color": color} for p in m["pieces"]]
+                await asyncio.to_thread(davinci.apply_timeline_cuts, cuts, f"Montagem {i+1} — {src_name}")
                 created += 1
             result = {"sequences": created}
         elif req.objective == "silences":
-            dur = _dv["source"]["duration_sec"] if _dv["source"] else 0.0
+            dur = _dv["timeline"]["duration_sec"] if _dv["timeline"] else 0.0
             sil = remove_silences(_require_transcript(), duration_sec=dur)
-            cuts = [{"start": c["start"], "end": c["end"]} for c in sil["cuts"]]
-            result = await asyncio.to_thread(davinci.apply_source_cuts, cuts, f"Sem silencios — {src_name}", "Green")
+            cuts = [{"start": c["start"], "end": c["end"], "color": "Green"} for c in sil["cuts"]]
+            result = await asyncio.to_thread(davinci.apply_timeline_cuts, cuts, f"Sem silencios — {src_name}")
         else:
             raise HTTPException(status_code=400, detail="Objetivo desconhecido.")
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return result
-
-
-def _dv_apply_colored(cuts: list, colors: list, name: str) -> dict:
-    """apply_source_cuts com uma cor por corte (para falas virais)."""
-    import core.adapters.davinci as dv
-    mpi, fps, _p, _n, _d, _tl = dv._get_main_source()
-    resolve = dv._bootstrap()
-    project = dv._current_project(resolve)
-    media_pool = project.GetMediaPool()
-    dv._set_output_folder(media_pool, name)  # pasta por timeline
-    clip_infos = []
-    for c in cuts:
-        # direcional: floor na entrada, ceil na saida -- corte nunca encolhe
-        sf, ef = math.floor(c["start"] * fps), math.ceil(c["end"] * fps)
-        if ef > sf:
-            clip_infos.append({"mediaPoolItem": mpi, "startFrame": sf, "endFrame": ef})
-    if not clip_infos:
-        raise RuntimeError("Nenhum corte valido.")
-    new_tl = media_pool.CreateTimelineFromClips(name, clip_infos)
-    if new_tl is None:
-        raise RuntimeError("CreateTimelineFromClips retornou None.")
-    items = new_tl.GetItemListInTrack("video", 1) or []
-    colored = 0
-    for i, item in enumerate(items):
-        if item.SetClipColor(colors[i] if i < len(colors) else "Blue"):
-            colored += 1
-    return {"applied": len(items), "colored": colored, "new_timeline_name": name, "warnings": []}

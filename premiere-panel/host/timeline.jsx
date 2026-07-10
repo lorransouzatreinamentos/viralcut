@@ -71,43 +71,47 @@ var VIRALCUT = (function () {
       }
     }
 
-    /** Pega o caminho do arquivo de MIDIA DE ORIGEM do clip principal da sequencia.
-     *  Abordagem aprendida do FastVideo (funciona nesta maquina): transcrever o
-     *  arquivo-fonte direto via ffmpeg dispensa .epr e render, e ja da timecodes
-     *  em tempo-de-origem — exatamente o que createSubClip precisa. */
-    function getSourceMediaPath() {
+    /** TODOS os clips de video da sequencia aberta, em SEGUNDOS (espelho de
+     *  davinci.list_timeline_clips). Corrige o bug de "so analisou o 1o video":
+     *  o painel transcreve cada arquivo-fonte e costura em tempo de timeline.
+     *
+     *  Por clip: source_key (caminho do arquivo), ref (nodeId p/ createSubClip),
+     *  src_in (in-point na origem), tl_start/tl_end (posicao na timeline). */
+    function getTimelineClips() {
       try {
         var seq = app.project.activeSequence;
-        if (!seq) return JSON.stringify({ error: "Nenhuma sequencia ativa." });
+        if (!seq) return JSON.stringify({ error: "Nenhuma sequencia ativa. Abra a timeline no Premiere." });
 
         var fps = TICKS_PER_SEC / parseFloat(seq.timebase);
-        // Escolhe o clip de video mais longo da sequencia (o conteudo principal).
-        var best = null, bestDur = -1;
+        var clips = [];
         for (var t = 0; t < seq.videoTracks.numTracks; t++) {
             var track = seq.videoTracks[t];
             for (var c = 0; c < track.clips.numItems; c++) {
                 var clip = track.clips[c];
                 if (!clip.projectItem) continue;
-                var dur = parseFloat(clip.end.ticks) - parseFloat(clip.start.ticks);
-                if (dur > bestDur) { bestDur = dur; best = clip; }
+                var path = "";
+                try { path = clip.projectItem.getMediaPath(); } catch (eP) {}
+                if (!path) continue; // clip sem midia de origem (titulo, cor solida): ignora
+                clips.push({
+                    source_key: path,
+                    ref: clip.projectItem.nodeId,
+                    src_in: parseFloat(clip.inPoint.ticks) / TICKS_PER_SEC,
+                    tl_start: parseFloat(clip.start.ticks) / TICKS_PER_SEC,
+                    tl_end: parseFloat(clip.end.ticks) / TICKS_PER_SEC,
+                    name: clip.name
+                });
             }
         }
-        if (!best) return JSON.stringify({ error: "Nenhum clip de video na sequencia." });
-
-        var path = "";
-        try { path = best.projectItem.getMediaPath(); } catch (eP) {}
-        if (!path) return JSON.stringify({ error: "Nao foi possivel obter o caminho da midia de origem." });
+        if (!clips.length) return JSON.stringify({ error: "A timeline aberta nao tem nenhum clip de video com midia." });
 
         return JSON.stringify({
-            path: path,
-            project_item_id: best.projectItem.nodeId,
+            name: seq.name,
             fps: fps,
-            name: best.name,
-            timeline_name: seq.name,   // sequencia aberta (a UI mostra os dois)
-            duration_sec: bestDur / TICKS_PER_SEC
+            duration_sec: parseFloat(seq.end) / TICKS_PER_SEC,
+            clips: clips
         });
       } catch (e) {
-        return JSON.stringify({ error: "getSourceMediaPath: " + (e && e.message ? e.message : String(e)) });
+        return JSON.stringify({ error: "getTimelineClips: " + (e && e.message ? e.message : String(e)) });
       }
     }
 
@@ -185,7 +189,7 @@ var VIRALCUT = (function () {
     return {
         version: version,
         getActiveSequenceInfo: getActiveSequenceInfo,
-        getSourceMediaPath: getSourceMediaPath,
+        getTimelineClips: getTimelineClips,
         applyCutPlan: applyCutPlan
     };
 })();

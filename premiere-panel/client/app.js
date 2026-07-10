@@ -30,26 +30,25 @@ function evalES(fnCall) {
 }
 function core() { if (!window.VIRALCUT_CORE) throw new Error("Núcleo não carregou. Reinicie o Premiere."); return window.VIRALCUT_CORE; }
 
-// --- Passo 1: selecionar sequência ---
+// --- Passo 1: selecionar a timeline (todos os vídeos dela) ---
 $("btnSelect").onclick = async () => {
   try {
-    let info;
+    let tlName, nClips, dur;
     if (IS_PREMIERE) {
-      info = await evalES("VIRALCUT.getSourceMediaPath()");
-      if (info.error) throw new Error(info.error);
-      window.__source = info;
+      // getTimelineClips retorna TODOS os clips da timeline (não só o 1o vídeo).
+      const seq = await evalES("VIRALCUT.getTimelineClips()");
+      if (seq.error) throw new Error(seq.error);
+      window.__seq = seq;                       // {name, fps, duration_sec, clips:[...]}
+      tlName = seq.name; nClips = seq.clips.length; dur = seq.duration_sec;
     } else {
-      info = await api("/davinci/select", { method: "POST" });
-      window.__source = info;
+      const info = await api("/davinci/select", { method: "POST" });
+      window.__seq = info;                      // {timeline_name, duration_sec, n_clips}
+      tlName = info.timeline_name; nClips = info.n_clips; dur = info.duration_sec;
     }
-    // Mostra a TIMELINE e o VÍDEO separados. Antes exibia só o nome do clipe
-    // num botão chamado "selecionar sequência", o que fazia parecer que o
-    // usuário tinha selecionado um vídeo em vez da timeline.
-    const tl = info.timeline_name
-      ? `<div>Timeline: <b>${info.timeline_name}</b></div>`
-      : "";
-    $("tlInfo").innerHTML = tl +
-      `<div>Vídeo: <b>${info.name}</b> · ${Math.round(info.duration_sec)}s · ${info.fps?.toFixed?.(2) || "?"} fps</div>`;
+    const plural = nClips === 1 ? "vídeo" : "vídeos";
+    $("tlInfo").innerHTML =
+      `<div>Timeline: <b>${tlName}</b></div>` +
+      `<div><b>${nClips}</b> ${plural} · ${Math.round(dur)}s no total</div>`;
     $("btnAnalyze").disabled = false;
   } catch (e) { msg($("tlInfo"), e.message, "err"); }
 };
@@ -63,7 +62,7 @@ async function runTranscribe(force) {
   try {
     let words, cached;
     if (IS_PREMIERE) {
-      transcript = await core().transcribe(window.__source, (p, t) => setP(p, t), force);
+      transcript = await core().transcribe(window.__seq, (p, t) => setP(p, t), force);
       words = transcript.words.length;
       cached = transcript.__cached;
     } else {
@@ -158,17 +157,17 @@ async function runObjective(name) {
   try {
     if (name === "viral") {
       currentData = IS_PREMIERE
-        ? await core().viralCuts(transcript, window.__source, o)
+        ? await core().viralCuts(transcript, window.__seq, o)
         : await api("/davinci/viral", { method: "POST", body: { min_dur: o.minDur, max_dur: o.maxDur } });
       renderClips(currentData.clips, currentData.rejected, o);
     } else if (name === "frankenbite") {
       currentData = IS_PREMIERE
-        ? await core().frankenbite(transcript, window.__source, o)
+        ? await core().frankenbite(transcript, window.__seq, o)
         : await api("/davinci/frankenbite", { method: "POST", body: { n_videos: o.nVideos, min_dur: o.minDur, max_dur: o.maxDur } });
       renderMontages(currentData.montages, o);
     } else {
       currentData = IS_PREMIERE
-        ? core().removeSilences(transcript, window.__source, o)
+        ? core().removeSilences(transcript, window.__seq, o)
         : { summary: await api("/davinci/silences", { method: "POST" }) };
       renderSilence(currentData.summary);
     }
@@ -254,7 +253,7 @@ $("btnApply").onclick = async () => {
       else msg($("applyMsg"), `✓ Timeline "${r.new_timeline_name}" criada (${r.applied} trechos).`, "ok");
       return;
     }
-    const src = window.__source;
+    const src = window.__seq;
     const seqBase = src.name || "sequencia";
     let result;
     if (currentObj === "viral") {

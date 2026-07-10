@@ -7,7 +7,6 @@ a partir do FastAPI deve rodar via asyncio.to_thread para nao bloquear o event l
 """
 from __future__ import annotations
 
-import math
 import os
 import time
 from dataclasses import dataclass
@@ -137,53 +136,51 @@ def build_clip_infos(
     fps: float,
     min_frame_dur: int = 1,
 ) -> tuple[list[dict], list[str]]:
-    """Converte cortes (start/end em segundos de audio) em clipInfo do Resolve.
+    """Converte cortes (start/end em segundos de TIMELINE) em clipInfo do Resolve.
 
     Retorna (clip_infos, warnings). Um corte que nao mapeia (cai num gap, ou o
     item de origem nao tem midia) e pulado com um warning em vez de derrubar
     a operacao inteira.
 
-    ponytail: um corte que cruza a fronteira entre dois itens da timeline e
-    grampeado ao item que contem seu inicio (warning emitido). Cobre o caso
-    comum (um video longo unico na timeline); multi-item com cortes cruzando
-    edicoes precisaria de split em N clipInfos — adicionar se surgir na pratica.
+    Um corte que CRUZA a fronteira entre dois videos da timeline vira VARIOS
+    clipInfos consecutivos, um por item que ele atravessa, todos com a mesma cor
+    e _clip_id. Sem isso, uma timeline com 5 videos so cortava dentro do primeiro
+    (bug reportado). A ordem dos itens na timeline e preservada.
     """
     clip_infos: list[dict] = []
     warnings: list[str] = []
+    ordered_items = sorted(timeline_items, key=lambda it: it.start)
 
     for clip in clips:
         cut_start_tl = timeline_start_frame + round(clip.start * fps)
         cut_end_tl = timeline_start_frame + round(clip.end * fps)
 
-        item = _find_item_containing(timeline_items, cut_start_tl)
-        if item is None:
+        intersected = False
+        for item in ordered_items:
+            seg_start = max(cut_start_tl, item.start)
+            seg_end = min(cut_end_tl, item.end)
+            if seg_end <= seg_start:
+                continue  # este item nao participa deste corte
+            intersected = True
+            if item.media_pool_item is None:
+                warnings.append(f"corte '{clip.titulo}': trecho sobre item sem midia de origem — pulado")
+                continue
+
+            source_in = item.left_offset + (seg_start - item.start)
+            source_out = item.left_offset + (seg_end - item.start)
+            if source_out - source_in < min_frame_dur:
+                continue  # fatia menor que 1 frame na fronteira; ignora em silencio
+
+            clip_infos.append({
+                "mediaPoolItem": item.media_pool_item,
+                "startFrame": source_in,
+                "endFrame": source_out,
+                "_clip_id": clip.id,     # so p/ correlacao/logs; removido antes de enviar ao Resolve
+                "_color": clip.color,
+            })
+
+        if not intersected:
             warnings.append(f"corte '{clip.titulo}' ({clip.start:.1f}s): sem clip na timeline nesse ponto — pulado")
-            continue
-        if item.media_pool_item is None:
-            warnings.append(f"corte '{clip.titulo}': item da timeline sem midia de origem — pulado")
-            continue
-
-        # Grampeia ao fim do item de origem se o corte ultrapassa a fronteira
-        clamped_end_tl = min(cut_end_tl, item.end)
-        if clamped_end_tl < cut_end_tl:
-            warnings.append(
-                f"corte '{clip.titulo}': cruza fronteira de clip na timeline — grampeado ao fim do clip"
-            )
-
-        source_in = item.left_offset + (cut_start_tl - item.start)
-        source_out = source_in + (clamped_end_tl - cut_start_tl)
-
-        if source_out - source_in < min_frame_dur:
-            warnings.append(f"corte '{clip.titulo}': duracao < {min_frame_dur} frame apos mapeamento — pulado")
-            continue
-
-        clip_infos.append({
-            "mediaPoolItem": item.media_pool_item,
-            "startFrame": source_in,
-            "endFrame": source_out,
-            "_clip_id": clip.id,     # so p/ correlacao/logs; removido antes de enviar ao Resolve
-            "_color": clip.color,
-        })
 
     return clip_infos, warnings
 
@@ -304,14 +301,16 @@ def list_timelines(project) -> list[str]:
     return names
 
 
-def _get_main_source():
-    """Retorna (media_pool_item, fps, path, name, duration_sec) do clip de video
-    mais longo da TIMELINE ABERTA. Reencontrado a cada chamada (nao cacheia objeto
-    do Resolve entre requisicoes HTTP).
+def list_timeline_clips() -> dict:
+    """TODOS os clipes de video da timeline aberta, em SEGUNDOS de timeline/origem.
 
-    Erro comum do usuario: selecionar um CLIPE no Media Pool em vez de abrir uma
-    timeline. O app trabalha sobre a timeline aberta na pagina Edit -- selecionar
-    um clipe nao a torna 'atual'. As mensagens abaixo dizem exatamente isso.
+    Corrige o bug de "so analisou o primeiro video": antes o app pegava so o clipe
+    mais longo. Agora devolve cada clipe para o Core transcrever a fala inteira.
+
+    Retorno JSON-safe:
+      { timeline_name, duration_sec, fps,
+        clips: [{source_key, src_in, tl_start, tl_end, name}],
+        sources: [paths unicos] }
     """
     resolve = _bootstrap()
     project = _current_project(resolve)
@@ -323,105 +322,70 @@ def _get_main_source():
             raise RuntimeError(
                 "Nenhuma timeline ABERTA. Selecionar um clipe no Media Pool nao basta — "
                 "o VIRALCUT trabalha sobre a timeline aberta na pagina Edit. "
-                f"Timelines neste projeto: {lista}. "
-                "Va na pagina Edit e de dois cliques em uma delas, depois tente de novo."
+                f"Timelines neste projeto: {lista}. Va na pagina Edit e de dois cliques em uma."
             )
-        raise RuntimeError(
-            "Este projeto nao tem nenhuma timeline. Arraste seu video para a "
-            "pagina Edit para criar uma timeline e tente de novo."
-        )
+        raise RuntimeError("Este projeto nao tem nenhuma timeline. Arraste seu video para a pagina Edit.")
 
-    best, best_dur = None, -1
+    tl_fps = float(timeline.GetSetting("timelineFrameRate"))
+    tl_start = int(timeline.GetStartFrame())
+
+    clips: list[dict] = []
+    sources: list[str] = []
     for t in range(1, timeline.GetTrackCount("video") + 1):
         for item in timeline.GetItemListInTrack("video", t) or []:
-            if item.GetMediaPoolItem() is None:
+            mpi = item.GetMediaPoolItem()
+            if mpi is None:
                 continue
-            dur = item.GetDuration()
-            if dur > best_dur:
-                best_dur, best = dur, item
-    if best is None:
+            props = mpi.GetClipProperty() or {}
+            path = props.get("File Path") or mpi.GetClipProperty("File Path")
+            if not path:
+                continue
+            try:
+                src_fps = float(props.get("FPS") or tl_fps)
+            except (TypeError, ValueError):
+                src_fps = tl_fps
+            # Posicao na timeline (segundos, relativa ao inicio da timeline).
+            tl_s = (int(item.GetStart()) - tl_start) / tl_fps
+            tl_e = (int(item.GetEnd()) - tl_start) / tl_fps
+            # In-point na origem (GetLeftOffset em frames de origem -> segundos).
+            src_in = int(item.GetLeftOffset()) / src_fps
+            clips.append({
+                "source_key": path, "src_in": src_in,
+                "tl_start": tl_s, "tl_end": tl_e,
+                "name": item.GetName() or "",
+            })
+            if path not in sources:
+                sources.append(path)
+
+    if not clips:
         raise RuntimeError(
-            f'A timeline aberta ("{timeline.GetName()}") nao tem nenhum clipe de video. '
-            "Abra a timeline que contem o video que voce quer analisar."
+            f'A timeline aberta ("{timeline.GetName()}") nao tem nenhum clipe de video.'
         )
 
-    mpi = best.GetMediaPoolItem()
-    props = mpi.GetClipProperty() or {}
-    path = props.get("File Path") or mpi.GetClipProperty("File Path")
-    if not path:
-        raise RuntimeError("Nao foi possivel obter o caminho do arquivo de origem.")
-    try:
-        fps = float(props.get("FPS") or float(timeline.GetSetting("timelineFrameRate")))
-    except (TypeError, ValueError):
-        fps = float(timeline.GetSetting("timelineFrameRate"))
-    try:
-        frames = int(props.get("Frames") or 0)
-    except (TypeError, ValueError):
-        frames = 0
-    duration = frames / fps if frames and fps else 0.0
-    name = props.get("Clip Name") or best.GetName() or "clip"
-    try:
-        timeline_name = timeline.GetName()
-    except Exception:  # noqa: BLE001
-        timeline_name = ""
-    return mpi, fps, path, name, duration, timeline_name
-
-
-def get_source_media_path() -> dict:
-    """Metadados do arquivo-fonte (JSON-safe) para a UI. Nao modifica nada.
-
-    Devolve o nome da TIMELINE e o do CLIPE separados: a UI mostrava so o nome do
-    clipe num botao chamado "selecionar sequencia", o que fazia o usuario pensar
-    que tinha selecionado um video em vez da timeline.
-    """
-    _mpi, fps, path, name, duration, timeline_name = _get_main_source()
+    duration = max(c["tl_end"] for c in clips)
     return {
-        "path": path, "fps": fps, "name": name,
-        "duration_sec": duration, "timeline_name": timeline_name,
+        "timeline_name": timeline.GetName(), "fps": tl_fps,
+        "duration_sec": duration, "clips": clips, "sources": sources,
     }
 
 
-def apply_source_cuts(cuts: list[dict], new_timeline_name: str, single_color: str | None = None) -> dict:
-    """Cria nova timeline com cortes em tempo-de-ORIGEM (segundos).
-    cuts: [{start, end}] em segundos do arquivo-fonte. Original intacta.
+def apply_timeline_cuts(cuts: list[dict], new_timeline_name: str) -> dict:
+    """Cria nova timeline com cortes em tempo de TIMELINE (segundos).
+
+    cuts: [{start, end, color?, titulo?, id?}]. Casca fina sobre apply_cuts, que
+    ja re-le a timeline e usa build_clip_infos (split multi-video). Um corte que
+    cruza a edicao entre videos vira varios pedacos automaticamente.
     """
+    from types import SimpleNamespace
     if not cuts:
         raise RuntimeError("Nenhum corte para aplicar.")
-
-    mpi, fps, _path, _name, _dur, _tl = _get_main_source()
-    resolve = _bootstrap()
-    project = _current_project(resolve)
-    media_pool = project.GetMediaPool()
-    _set_output_folder(media_pool, new_timeline_name)  # pasta por timeline (organiza o Media Pool)
-
-    clip_infos = []
-    for c in cuts:
-        # Arredondamento DIRECIONAL: o corte nunca pode encolher.
-        # round() nos dois lados podia perder ate meio frame em cada ponta,
-        # decepando a silaba final. floor na entrada, ceil na saida.
-        sf = math.floor(c["start"] * fps)
-        ef = math.ceil(c["end"] * fps)
-        if ef <= sf:
-            continue
-        clip_infos.append({"mediaPoolItem": mpi, "startFrame": sf, "endFrame": ef})
-    if not clip_infos:
-        raise RuntimeError("Nenhum corte valido apos conversao para frames.")
-
-    new_timeline = media_pool.CreateTimelineFromClips(new_timeline_name, clip_infos)
-    if new_timeline is None:
-        raise RuntimeError("CreateTimelineFromClips retornou None — Resolve recusou a criacao.")
-
-    new_items = new_timeline.GetItemListInTrack("video", 1) or []
-    colored = 0
-    for i, item in enumerate(new_items):
-        color = single_color or _DAVINCI_COLORS[i % len(_DAVINCI_COLORS)]
-        if item.SetClipColor(color):
-            colored += 1
-
-    return {
-        "applied": len(new_items),
-        "expected": len(clip_infos),
-        "colored": colored,
-        "new_timeline_name": new_timeline_name,
-        "warnings": [],
-    }
+    objs = [
+        SimpleNamespace(
+            start=c["start"], end=c["end"],
+            color=c.get("color", "Blue"),
+            titulo=c.get("titulo", "corte"),
+            id=c.get("id", f"c{i}"),
+        )
+        for i, c in enumerate(cuts)
+    ]
+    return apply_cuts(objs, new_timeline_name)
