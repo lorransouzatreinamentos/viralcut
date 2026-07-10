@@ -786,6 +786,16 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
     }
   }
 
+  // Arquivos gerados a cada instalacao (versao com timestamp, copia de ui/app.js).
+  // Em clones de ANTES deste fix eles ainda estao rastreados e ficaram sujos --
+  // sem descartar isso primeiro, o git pull recusa com "local changes would be
+  // overwritten". Sao 100% regeraveis pelo proprio install-premiere.sh a seguir,
+  // entao descartar e sempre seguro.
+  var GENERATED_PANEL_FILES = [
+    "premiere-panel/client/app.js", "premiere-panel/client/version.js",
+    "premiere-panel/host/version.jsx", "premiere-panel/host/bundle.jsx"
+  ];
+
   // Atualiza o painel: PUXA do git (repo em ~/viralcut, o instalador clona ali) e
   // depois resincroniza o painel CEP com o que acabou de chegar.
   // ANTES: so resincronizava a copia local, sem git pull, e usava caminho fixo
@@ -796,15 +806,22 @@ A montagem soa como UMA fala contínua e proposital, MAS as peças vêm de lugar
       if (!root) return reject(new Error(
         "Repositorio nao encontrado. Rode o instalador (install-mac.sh / install-windows.ps1)."
       ));
-      childProcess.execFile("git", ["pull", "--ff-only"], { cwd: root, timeout: 30000 },
-        function (errPull, _out, errPullStderr) {
-          if (errPull) return reject(new Error("git pull falhou: " + (errPullStderr || errPull.message).slice(-300)));
-          var script = path.join(root, "scripts", "install-premiere.sh");
-          childProcess.execFile("bash", [script], { timeout: 60000 }, function (err, stdout, stderr) {
-            if (err) return reject(new Error("update falhou: " + (stderr || err.message).slice(-300)));
-            resolve(String(stdout).trim());
+      // best-effort: se os arquivos ja estiverem sem rastreamento (clones novos),
+      // isto so falha em silencio -- nao impede o pull.
+      childProcess.execFile("git", ["checkout", "--"].concat(GENERATED_PANEL_FILES),
+        { cwd: root, timeout: 15000 }, function () { doPull(); });
+
+      function doPull() {
+        childProcess.execFile("git", ["pull", "--ff-only"], { cwd: root, timeout: 30000 },
+          function (errPull, _out, errPullStderr) {
+            if (errPull) return reject(new Error("git pull falhou: " + (errPullStderr || errPull.message).slice(-300)));
+            var script = path.join(root, "scripts", "install-premiere.sh");
+            childProcess.execFile("bash", [script], { timeout: 60000 }, function (err, stdout, stderr) {
+              if (err) return reject(new Error("update falhou: " + (stderr || err.message).slice(-300)));
+              resolve(String(stdout).trim());
+            });
           });
-        });
+      }
     });
   }
 
