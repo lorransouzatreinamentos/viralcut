@@ -108,16 +108,31 @@ Say "  [ok] usando $PyExe $($PyArgs -join ' ') (versoes/instalacoes existentes n
 
 # ---------------------------------------------------------------------
 Step "3/6  Baixando o VIRALCUT"
+
+# Arquivos gerados a cada instalacao (versao com timestamp, copia de ui/app.js).
+# Em clones ANTIGOS eles estao rastreados e ficam sujos -> o git pull recusa com
+# "local changes would be overwritten" e o app roda o CODIGO VELHO (o bug do
+# Windows selecionando video em vez da timeline). Descartar antes do pull destrava.
+# Sao 100% regeraveis pelo proprio instalador a seguir. Funcao reutilizavel:
+function Update-Repo($Path) {
+    $gen = @(
+        "premiere-panel/client/app.js", "premiere-panel/client/version.js",
+        "premiere-panel/host/version.jsx", "premiere-panel/host/bundle.jsx"
+    )
+    git -C $Path checkout -- $gen 2>$null   # best-effort: em clone novo nao existem, ignora
+    git -C $Path pull --ff-only
+}
+
 # Se este script ja esta dentro do repo (usuario clonou antes), usa essa pasta.
 if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "requirements.txt"))) {
     $Dest = $PSScriptRoot
     Say "  usando o repositorio ja baixado em $Dest" "DarkGray"
-    git -C $Dest pull --ff-only 2>$null
+    Update-Repo $Dest
 } else {
     $Dest = Join-Path $env:USERPROFILE "viralcut"
     if (Test-Path (Join-Path $Dest ".git")) {
         Say "  ja existe em $Dest - atualizando..." "DarkGray"
-        git -C $Dest pull --ff-only
+        Update-Repo $Dest
     } else {
         Say "  clonando para $Dest" "DarkGray"
         Say "  (se pedir login do GitHub, autorize no navegador)" "DarkGray"

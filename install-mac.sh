@@ -152,6 +152,9 @@ cat > "$DEST/viralcut.command" <<LAUNCHER
 #!/usr/bin/env bash
 # VIRALCUT — launcher (macOS). Atualiza, sobe o servidor local e abre o app.
 cd "\$(dirname "\$0")"
+# Descarta os arquivos gerados (regeraveis) antes do pull -- em clones antigos eles
+# ficam sujos e travam o git pull, deixando o app rodar o codigo velho.
+git checkout -- premiere-panel/client/app.js premiere-panel/client/version.js premiere-panel/host/version.jsx premiere-panel/host/bundle.jsx >/dev/null 2>&1 || true
 git pull --ff-only >/dev/null 2>&1 || true
 
 export RESOLVE_SCRIPT_API="$RS_API"

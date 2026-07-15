@@ -16,6 +16,10 @@ if not exist ".venv\Scripts\activate.bat" (
 )
 
 echo Buscando atualizacoes...
+REM Descarta os arquivos gerados (regeraveis) antes do pull -- em clones antigos
+REM eles ficam sujos e travam o git pull, deixando o app rodar o codigo velho
+REM (bug do Windows selecionando video em vez da timeline).
+git checkout -- premiere-panel/client/app.js premiere-panel/client/version.js premiere-panel/host/version.jsx premiere-panel/host/bundle.jsx 2>nul
 git pull --ff-only 2>nul
 
 REM DaVinci Resolve scripting (Windows) - necessario para o app falar com o Resolve
