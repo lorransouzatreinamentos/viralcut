@@ -36,7 +36,7 @@ def _sample_transcript() -> TranscriptState:
 
 def test_build_user_prompt_includes_segments_and_constraints():
     transcript = _sample_transcript()
-    prompt = _build_user_prompt(transcript, min_score=60, max_clips=5, min_dur=20.0, max_dur=90.0)
+    prompt = _build_user_prompt(transcript.segments, min_score=60, max_clips=5, min_dur=20.0, max_dur=90.0)
 
     assert "[seg 0 | 12.00-12.50] todo mundo" in prompt
     assert "[seg 2 | 50.00-51.00] hoje vamos mudar" in prompt

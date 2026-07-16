@@ -257,10 +257,13 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   // ---------------------------------------------------------------------------
   // Extracao de cortes virais (GPT, tool call, SOMENTE IDs)
   // ---------------------------------------------------------------------------
-  function buildUserPrompt(transcript, minScore, maxClips, minDur, maxDur) {
+  // segments: lista de segmentos a enviar (pode ser um LOTE, nao a transcricao
+  // inteira -- ver chunkSegments). Os ids sao absolutos e batem com a transcricao
+  // completa na hora de resolver o timecode, entao enviar um lote e seguro.
+  function buildUserPrompt(segments, minScore, maxClips, minDur, maxDur) {
     var lines = [];
-    for (var i = 0; i < transcript.segments.length; i++) {
-      var s = transcript.segments[i];
+    for (var i = 0; i < segments.length; i++) {
+      var s = segments[i];
       lines.push("[seg " + s.id + " | " + s.start.toFixed(1) + "-" + s.end.toFixed(1) + "] " + s.text);
     }
     return "DURACAO ALVO: " + minDur + "-" + maxDur + "s. MAX CORTES: " + maxClips +
@@ -315,7 +318,9 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
     if (!res.ok) {
       var detail = "HTTP " + res.status;
       try { var j = await res.json(); if (j.error && j.error.message) detail = j.error.message; } catch (e) {}
-      throw new Error("IA falhou: " + detail);
+      var err = new Error("IA falhou: " + detail);
+      err.status = res.status;  // usado pelo retry (429 = rate limit)
+      throw err;
     }
     var data = await res.json();
     var calls = data.choices[0].message.tool_calls;
@@ -323,6 +328,52 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
     var args = calls[0].function.arguments;
     if (logSink) { logSink.sent = userPrompt; logSink.llm_raw = args; }
     return JSON.parse(args);
+  }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  // hook so para teste: troca o sleep real por um instantaneo (retry-em-429 nao
+  // precisa esperar de verdade num teste automatizado).
+  function __setSleepForTests(fn) { sleep = fn; }
+
+  // Retry com backoff SO para rate limit (429) -- contas com TPM baixo (ex: 30000)
+  // estouram em transcricoes longas; um retry apos alguns segundos costuma
+  // resolver porque a janela de 1 minuto libera de novo. Nao reencaminha outros
+  // erros (schema invalido, chave errada etc -- esses falham na hora, retry nao ajuda).
+  async function gptCallWithRetry(apiKey, systemPrompt, userPrompt, toolName, schema, logSink, temperature) {
+    var attempts = 3, delay = 6000;
+    for (var i = 0; i < attempts; i++) {
+      try {
+        return await gptCall(apiKey, systemPrompt, userPrompt, toolName, schema, logSink, temperature);
+      } catch (e) {
+        if (e.status !== 429 || i === attempts - 1) throw e;
+        await sleep(delay);
+        delay *= 2;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Divisao em LOTES da transcricao (anti rate-limit / TPM). Contas OpenAI de tier
+  // baixo tem limite de tokens/minuto tao apertado (ex: 30000) que uma transcricao
+  // de video longo sozinha já estoura num unico prompt ("Request too large").
+  // Cada corte viral e AUTOCONTIDO (nao precisa ver o video inteiro pra ser bom),
+  // entao dividir em lotes e seguro: cada lote vira 1 chamada de IA menor, os
+  // candidatos de todos os lotes sao juntados e filtrados no final (resolveClips),
+  // exatamente como se tivesse vindo de uma unica chamada.
+  var CHUNK_MAX_CHARS = 16000;  // ~4000 tokens -- folga generosa mesmo p/ contas restritas
+
+  function chunkSegments(segments, maxChars) {
+    maxChars = maxChars || CHUNK_MAX_CHARS;
+    var chunks = [], cur = [], curLen = 0;
+    for (var i = 0; i < segments.length; i++) {
+      var s = segments[i];
+      var lineLen = s.text.length + 30; // aprox. do prefixo "[seg N | 0.0-0.0] "
+      if (cur.length && curLen + lineLen > maxChars) { chunks.push(cur); cur = []; curLen = 0; }
+      cur.push(s);
+      curLen += lineLen;
+    }
+    if (cur.length) chunks.push(cur);
+    return chunks;
   }
 
   // ---------------------------------------------------------------------------
@@ -812,16 +863,39 @@ Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" 
     var minScore = opts.minScore || 45;
     var maxClips = opts.maxClips || 12;
     var sink = { type: "viral", min_dur: minDur, max_dur: maxDur, min_score: minScore, max_clips: maxClips };
-    var user = buildUserPrompt(transcript, minScore, maxClips, minDur, maxDur);
-    var out = await gptCall(apiKey, SYSTEM_PROMPT_VIRAL, user, "propose_clips", CLIP_SCHEMA, sink);
+
+    // LOTES: transcricoes longas estouram o limite de tokens/minuto da conta
+    // OpenAI numa unica chamada ("Request too large ... TPM"). Cada corte viral e
+    // autocontido, entao dividir em lotes e seguro -- os candidatos de todos os
+    // lotes sao juntados e filtrados no final, exatamente como uma unica chamada.
+    var chunks = chunkSegments(transcript.segments);
+    var allRawClips = [];
+    var chunksFalhos = 0;
+    for (var ci = 0; ci < chunks.length; ci++) {
+      var user = buildUserPrompt(chunks[ci], minScore, maxClips, minDur, maxDur);
+      try {
+        var out = await gptCallWithRetry(apiKey, SYSTEM_PROMPT_VIRAL, user, "propose_clips", CLIP_SCHEMA, null, 0.1);
+        allRawClips = allRawClips.concat(out.clips || []);
+      } catch (e) {
+        // um lote falhar nao derruba os outros -- resultado parcial e melhor que nada
+        chunksFalhos++;
+      }
+    }
+    if (chunksFalhos === chunks.length) throw new Error("IA falhou em todos os lotes da transcrição. Tente novamente em 1 minuto (limite de uso da conta).");
+    sink.lotes = chunks.length;
+    sink.lotes_falhos = chunksFalhos;
+
     // enforcement em codigo: a IA nao respeita duracao/score de forma confiavel.
     // Espelha _resolve_and_filter (Python): filtra score, faixa de duracao e corta em maxClips.
-    var clips = resolveClips(out.clips || [], transcript, minDur, maxDur, minScore, maxClips);
+    // Roda UMA VEZ sobre a transcricao INTEIRA (nao por lote) -- mantem o corte
+    // final consistente mesmo vindo de multiplas chamadas de IA.
+    var clips = resolveClips(allRawClips, transcript, minDur, maxDur, minScore, maxClips);
     var rej = clips._rejected || { curto: 0, longo: 0 };
     sink.rejeitados = rej;
     sink.resolved = clips.map(function (c) { return { titulo: c.titulo, score: c.score, start: c.start, end: c.end, dur: +(c.end - c.start).toFixed(1), text: c.text }; });
     sink.summary = clips.length + " cortes (" + minDur + "-" + maxDur + "s) | descartados: " +
-      rej.curto + " curtos, " + rej.longo + " longos";
+      rej.curto + " curtos, " + rej.longo + " longos" +
+      (chunks.length > 1 ? " | " + chunks.length + " lote(s)" + (chunksFalhos ? ", " + chunksFalhos + " falharam" : "") : "");
     logObjective(sink);
     return { clips: clips, rejected: rej, minDur: minDur, maxDur: maxDur };
   }
@@ -842,10 +916,24 @@ Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" 
     var maxDur = opts.maxDur || 90;
     var requestCount = Math.min(nVideos + MONTAGE_REQUEST_BUFFER, MONTAGE_REQUEST_CAP);
     var sink = { type: "frankenbite", pedidos: nVideos, request_count: requestCount, min_dur: minDur, max_dur: maxDur };
-    var segLines = [];
-    for (var si = 0; si < transcript.segments.length; si++) {
-      var s = transcript.segments[si];
-      segLines.push("[seg " + s.id + " | " + s.start.toFixed(1) + "-" + s.end.toFixed(1) + "] " + s.text);
+    // Montagem PRECISA ver o video inteiro numa unica chamada (e o que garante o
+    // espalhamento por comeco/meio/fim) -- ao contrario dos cortes virais, aqui NAO
+    // dividimos em lotes. Em transcricoes muito longas isso ainda pode estourar o
+    // limite de tokens/minuto da conta; se a listagem completa passar de um teto
+    // seguro, comprime o texto ecoado por linha (so o PREVIEW que a IA le -- o texto
+    // real de cada peca sempre vem do id na hora de montar, nunca do que foi truncado
+    // aqui, entao isso nunca degrada o resultado final, so reduz o que a IA "le").
+    var MONTAGE_PROMPT_BUDGET = 22000;
+    var segLinesFull = transcript.segments.map(function (s) {
+      return "[seg " + s.id + " | " + s.start.toFixed(1) + "-" + s.end.toFixed(1) + "] " + s.text;
+    });
+    var segLines = segLinesFull;
+    if (segLinesFull.join("\n").length > MONTAGE_PROMPT_BUDGET) {
+      segLines = transcript.segments.map(function (s) {
+        var t = s.text.length > 70 ? s.text.slice(0, 70) + "…" : s.text;
+        return "[seg " + s.id + " | " + s.start.toFixed(1) + "-" + s.end.toFixed(1) + "] " + t;
+      });
+      sink.preview_truncado = true;
     }
     var user = "GERE " + requestCount + " PROPOSTAS DE MONTAGEM. DURAÇÃO ALVO: " + minDur + "-" + maxDur +
       "s (some as durações dos segmentos escolhidos).\n\nIMPORTANTE: o sistema descarta automaticamente " +
@@ -856,7 +944,7 @@ Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" 
       segLines.join("\n") +
       "\n\nCrie montagens costurando segmentos de momentos diferentes numa narrativa nova e mais forte. " +
       "Cada montagem é uma lista ORDENADA de ids (ordem de reprodução). Ordene as montagens por score.";
-    var out = await gptCall(apiKey, SYSTEM_PROMPT_MONTAGE, user, "propose_montages", MONTAGE_SCHEMA, sink, 0.8);
+    var out = await gptCallWithRetry(apiKey, SYSTEM_PROMPT_MONTAGE, user, "propose_montages", MONTAGE_SCHEMA, sink, 0.8);
     var raw = out.montagens || [];
     // pre-computa a lista de palavras ordenada (para o padding adaptativo por trecho)
     var wordsSorted = transcript.words.slice().sort(function (a, b) { return a.start - b.start; });
@@ -881,7 +969,7 @@ Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" 
     var reprovadas = 0;
     if (montages.length) {
       try {
-        var critica = await gptCall(apiKey, SYSTEM_PROMPT_CRITICA,
+        var critica = await gptCallWithRetry(apiKey, SYSTEM_PROMPT_CRITICA,
           "Avalie cada montagem (blocos separados por //):\n\n" +
           montages.map(function (mm, ix) { return "[montagem " + ix + "] " + mm.text; }).join("\n\n"),
           "avaliar_montagens", CRITICA_SCHEMA, null, 0.15);
@@ -1008,6 +1096,10 @@ Seja rigoroso: na dúvida, REPROVE. É melhor a ferramenta dizer "sem material" 
     _segmentsTooSimilar: segmentsTooSimilar,
     _MONTAGE_REQUEST_BUFFER: MONTAGE_REQUEST_BUFFER,
     _MONTAGE_REQUEST_CAP: MONTAGE_REQUEST_CAP,
+    _chunkSegments: chunkSegments,
+    _CHUNK_MAX_CHARS: CHUNK_MAX_CHARS,
+    _gptCallWithRetry: gptCallWithRetry,
+    __setSleepForTests: __setSleepForTests,
     _secToTicks: secToTicks,
     _detectSpokenSpans: detectSpokenSpans,
     _readOpenAIKey: readOpenAIKey

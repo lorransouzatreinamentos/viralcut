@@ -9,6 +9,7 @@ das palavras reais (ver model.resolve). Timecodes aqui sao em SEGUNDOS de origem
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -101,8 +102,23 @@ MONTAGE_SCHEMA = {
 }
 
 
+# Montagem PRECISA ver o video inteiro numa unica chamada (e o que garante o
+# espalhamento por comeco/meio/fim) -- ao contrario dos cortes virais, aqui NAO
+# dividimos em lotes. Em transcricoes muito longas isso ainda pode estourar o
+# limite de tokens/minuto da conta; se a listagem completa passar de um teto
+# seguro, comprime o texto ecoado por linha (so o PREVIEW que a IA le -- o texto
+# real de cada peca sempre vem do id na hora de montar, nunca do que foi truncado
+# aqui, entao isso nunca degrada o resultado final, so reduz o que a IA "le").
+MONTAGE_PROMPT_BUDGET = 22000
+
+
 def _build_montage_prompt(transcript: TranscriptState, request_count: int, min_dur: float, max_dur: float) -> str:
     lines = [f"[seg {s.id} | {s.start:.1f}-{s.end:.1f}] {s.text}" for s in transcript.segments]
+    if len("\n".join(lines)) > MONTAGE_PROMPT_BUDGET:
+        lines = [
+            f"[seg {s.id} | {s.start:.1f}-{s.end:.1f}] {(s.text[:70] + '…') if len(s.text) > 70 else s.text}"
+            for s in transcript.segments
+        ]
     return (
         f"GERE {request_count} PROPOSTAS DE MONTAGEM. DURACAO ALVO: {min_dur:.0f}-{max_dur:.0f}s.\n\n"
         f"IMPORTANTE: o sistema descarta automaticamente qualquer proposta cujos segmentos fiquem "
@@ -116,33 +132,50 @@ def _build_montage_prompt(transcript: TranscriptState, request_count: int, min_d
     )
 
 
+async def _post_openai_with_retry(payload: dict) -> dict:
+    """POST na Chat Completions API com retry-com-backoff SO para rate limit
+    (429). Contas com TPM baixo (ex: 30000) estouram em transcricoes/montagens
+    longas; um retry apos alguns segundos costuma resolver porque a janela de 1
+    minuto libera de novo. Outros erros nao sao retentados -- retry nao ajudaria."""
+    attempts, delay = 3, 6.0
+    for attempt in range(attempts):
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                OPENAI_URL,
+                headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+        if resp.status_code == 429 and attempt < attempts - 1:
+            await asyncio.sleep(delay)
+            delay *= 2
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    resp.raise_for_status()  # pragma: no cover -- inalcancavel, so satisfaz o linter
+    return resp.json()  # pragma: no cover
+
+
 async def _call_openai_montage(transcript: TranscriptState, request_count: int, min_dur: float, max_dur: float) -> dict:
     if not settings.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY nao configurada")
     model = settings.llm_model if settings.llm_provider == "openai" else "gpt-4o"
     user = _build_montage_prompt(transcript, request_count, min_dur, max_dur)
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            OPENAI_URL,
-            headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
-            json={
-                # Montagem PRECISA de variedade (varias narrativas diferentes). Com
-                # temperature baixa a IA devolvia montagens quase iguais que colapsavam
-                # em 1 apos dedup. Cortes virais mantem temp baixa (precisao); aqui e
-                # o oposto -- queremos diversidade entre as propostas.
-                "model": model,
-                "temperature": 0.8,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT_MONTAGE},
-                    {"role": "user", "content": user},
-                ],
-                "tools": [{"type": "function", "function": {
-                    "name": "propose_montages", "parameters": MONTAGE_SCHEMA}}],
-                "tool_choice": {"type": "function", "function": {"name": "propose_montages"}},
-            },
-        )
-    resp.raise_for_status()
-    calls = resp.json()["choices"][0]["message"].get("tool_calls")
+    data = await _post_openai_with_retry({
+        # Montagem PRECISA de variedade (varias narrativas diferentes). Com
+        # temperature baixa a IA devolvia montagens quase iguais que colapsavam
+        # em 1 apos dedup. Cortes virais mantem temp baixa (precisao); aqui e
+        # o oposto -- queremos diversidade entre as propostas.
+        "model": model,
+        "temperature": 0.8,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT_MONTAGE},
+            {"role": "user", "content": user},
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "propose_montages", "parameters": MONTAGE_SCHEMA}}],
+        "tool_choice": {"type": "function", "function": {"name": "propose_montages"}},
+    })
+    calls = data["choices"][0]["message"].get("tool_calls")
     if not calls:
         raise RuntimeError("OpenAI nao retornou montagens.")
     return json.loads(calls[0]["function"]["arguments"])
@@ -284,24 +317,18 @@ async def _call_openai_critique(montages: list[dict]) -> dict:
     model = settings.llm_model if settings.llm_provider == "openai" else "gpt-4o"
     linhas = [f"[montagem {i}] {m['text']}" for i, m in enumerate(montages)]
     user = "Avalie cada montagem (blocos separados por //):\n\n" + "\n\n".join(linhas)
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            OPENAI_URL,
-            headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "temperature": 0.15,  # critica e julgamento -> frio e consistente
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT_CRITICA},
-                    {"role": "user", "content": user},
-                ],
-                "tools": [{"type": "function", "function": {
-                    "name": "avaliar_montagens", "parameters": CRITICA_SCHEMA}}],
-                "tool_choice": {"type": "function", "function": {"name": "avaliar_montagens"}},
-            },
-        )
-    resp.raise_for_status()
-    calls = resp.json()["choices"][0]["message"].get("tool_calls")
+    data = await _post_openai_with_retry({
+        "model": model,
+        "temperature": 0.15,  # critica e julgamento -> frio e consistente
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT_CRITICA},
+            {"role": "user", "content": user},
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "avaliar_montagens", "parameters": CRITICA_SCHEMA}}],
+        "tool_choice": {"type": "function", "function": {"name": "avaliar_montagens"}},
+    })
+    calls = data["choices"][0]["message"].get("tool_calls")
     if not calls:
         return {"avaliacoes": []}
     return json.loads(calls[0]["function"]["arguments"])

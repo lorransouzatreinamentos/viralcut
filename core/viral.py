@@ -15,11 +15,13 @@ frouxo (2.5s de tolerancia) mascarava quando ela errava. Aqui:
 """
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 from pydantic import BaseModel, ValidationError
 
 from core.config import settings
-from core.model import HighlightClip, LLMHighlightRaw, TranscriptState, resolve_highlight
+from core.model import HighlightClip, LLMHighlightRaw, Segment, TranscriptState, resolve_highlight
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
@@ -38,10 +40,42 @@ class LLMHighlightBatch(BaseModel):
     clips: list[LLMHighlightRaw]
 
 
+# LOTES (anti rate-limit/TPM): contas OpenAI de tier baixo tem limite de
+# tokens/minuto tao apertado (ex: 30000) que a transcricao de um video longo
+# sozinha estoura um unico prompt ("Request too large"). Cada corte viral e
+# AUTOCONTIDO (nao precisa ver o video inteiro pra ser bom), entao dividir em
+# lotes e seguro -- os candidatos de todos os lotes sao juntados e filtrados
+# no final (_resolve_and_filter), como se tivessem vindo de uma unica chamada.
+CHUNK_MAX_CHARS = 16000  # ~4000 tokens -- folga generosa mesmo p/ contas restritas
+
+
+def _chunk_segments(segments: list[Segment], max_chars: int = CHUNK_MAX_CHARS) -> list[list[Segment]]:
+    chunks: list[list[Segment]] = []
+    cur: list[Segment] = []
+    cur_len = 0
+    for s in segments:
+        line_len = len(s.text) + 30  # aprox. do prefixo "[seg N | 0.00-0.00] "
+        if cur and cur_len + line_len > max_chars:
+            chunks.append(cur)
+            cur, cur_len = [], 0
+        cur.append(s)
+        cur_len += line_len
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+async def _sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
 def _build_user_prompt(
-    transcript: TranscriptState, min_score: int, max_clips: int, min_dur: float, max_dur: float
+    segments: list[Segment], min_score: int, max_clips: int, min_dur: float, max_dur: float
 ) -> str:
-    lines = [f"[seg {s.id} | {s.start:.2f}-{s.end:.2f}] {s.text}" for s in transcript.segments]
+    """segments: lote a enviar (pode ser um subconjunto -- ver _chunk_segments).
+    Os ids sao absolutos e batem com a transcricao completa na hora de resolver
+    o timecode, entao enviar um lote e seguro."""
+    lines = [f"[seg {s.id} | {s.start:.2f}-{s.end:.2f}] {s.text}" for s in segments]
     return f"""DURACAO ALVO DOS CORTES: {min_dur:.0f}-{max_dur:.0f} segundos (ALVO, nao regra rigida)
 N. MAXIMO DE CORTES: {max_clips}
 SCORE MINIMO: {min_score}
@@ -119,12 +153,12 @@ def _resolve_and_filter(
 
 
 async def _call_anthropic(
-    transcript: TranscriptState, min_score: int, max_clips: int, min_dur: float, max_dur: float
+    segments: list[Segment], min_score: int, max_clips: int, min_dur: float, max_dur: float
 ) -> dict:
     if not settings.anthropic_api_key:
         raise RuntimeError("ANTHROPIC_API_KEY nao configurada (.env)")
 
-    user_prompt = _build_user_prompt(transcript, min_score, max_clips, min_dur, max_dur)
+    user_prompt = _build_user_prompt(segments, min_score, max_clips, min_dur, max_dur)
     tool_schema = LLMHighlightBatch.model_json_schema()
 
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -156,14 +190,14 @@ async def _call_anthropic(
 
 
 async def _call_openai(
-    transcript: TranscriptState, min_score: int, max_clips: int, min_dur: float, max_dur: float
+    segments: list[Segment], min_score: int, max_clips: int, min_dur: float, max_dur: float
 ) -> dict:
     """Mesma estrategia do Anthropic: function calling forcado com o schema pydantic.
     O modelo so pode responder chamando propose_clips (sem campo de timestamp)."""
     if not settings.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY nao configurada (.env)")
 
-    user_prompt = _build_user_prompt(transcript, min_score, max_clips, min_dur, max_dur)
+    user_prompt = _build_user_prompt(segments, min_score, max_clips, min_dur, max_dur)
     model = settings.llm_model if settings.llm_provider == "openai" else "gpt-4o"
 
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -202,6 +236,27 @@ async def _call_openai(
     return json.loads(tool_calls[0]["function"]["arguments"])
 
 
+async def _call_llm_batch_with_retry(
+    segments: list[Segment], min_score: int, max_clips: int, min_dur: float, max_dur: float,
+) -> dict:
+    """1 lote, com retry-com-backoff SO para rate limit (429). Contas com TPM baixo
+    (ex: 30000) estouram em transcricoes longas; um retry apos alguns segundos
+    costuma resolver porque a janela de 1 minuto libera de novo. Outros erros
+    (schema invalido, chave errada) nao sao retentados -- retry nao ajudaria."""
+    attempts, delay = 3, 6.0
+    for attempt in range(attempts):
+        try:
+            if settings.llm_provider == "openai":
+                return await _call_openai(segments, min_score, max_clips, min_dur, max_dur)
+            data = await _call_anthropic(segments, min_score, max_clips, min_dur, max_dur)
+            return _extract_tool_use_input(data)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 429 or attempt == attempts - 1:
+                raise
+            await _sleep(delay)
+            delay *= 2
+
+
 async def extract_viral_clips(
     transcript: TranscriptState,
     min_score: int = 50,
@@ -209,13 +264,29 @@ async def extract_viral_clips(
     min_dur: float = 30.0,
     max_dur: float = 90.0,
 ) -> tuple[list[HighlightClip], dict]:
-    """Retorna (clips, rejeitados). A faixa de duracao e aplicada em codigo."""
+    """Retorna (clips, rejeitados). A faixa de duracao e aplicada em codigo.
+
+    LOTES: transcricoes longas estouram o limite de tokens/minuto da conta
+    (OpenAI "Request too large ... TPM"). Cada lote e uma chamada de IA menor;
+    os candidatos de todos os lotes sao juntados e filtrados UMA VEZ no final
+    (_resolve_and_filter), como se tivessem vindo de uma unica chamada."""
     if not transcript.segments:
         return [], {"curto": 0, "longo": 0}
 
-    if settings.llm_provider == "openai":
-        raw_input = await _call_openai(transcript, min_score, max_clips, min_dur, max_dur)
-    else:
-        data = await _call_anthropic(transcript, min_score, max_clips, min_dur, max_dur)
-        raw_input = _extract_tool_use_input(data)
-    return _resolve_and_filter(raw_input, transcript, min_score, max_clips, min_dur, max_dur)
+    chunks = _chunk_segments(transcript.segments)
+    all_raw_clips: list[dict] = []
+    chunks_falhos = 0
+    for chunk in chunks:
+        try:
+            raw_input = await _call_llm_batch_with_retry(chunk, min_score, max_clips, min_dur, max_dur)
+            all_raw_clips.extend(raw_input.get("clips", []))
+        except Exception:  # noqa: BLE001 -- um lote falhar nao derruba os outros
+            chunks_falhos += 1
+
+    if chunks_falhos == len(chunks):
+        raise RuntimeError(
+            "IA falhou em todos os lotes da transcricao. Tente novamente em 1 minuto "
+            "(limite de uso da conta)."
+        )
+
+    return _resolve_and_filter({"clips": all_raw_clips}, transcript, min_score, max_clips, min_dur, max_dur)
