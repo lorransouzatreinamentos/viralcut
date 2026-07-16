@@ -35,19 +35,37 @@
     path.join(HOME, ".viralcut.env"),
     "/Applications/CLAUDE CODE/Projetos/VIRALCUT/.env" // legado (Mac do dono)
   ];
-  // Script compartilhado com o Core Python (mesma implementacao da engine local).
-  // ATENCAO: dentro do painel Adobe (CEP), __dirname NAO aponta de forma confiavel
-  // para client/ -- em algumas versoes ele resolve para a raiz da extensao, o que
-  // fazia o caminho virar .../extensions/host/ (sem o VIRALCUT/) e o app nao achar
-  // o script. Por isso procuramos em varios candidatos e usamos o 1o que existir.
-  // O primario e ~/viralcut/premiere-panel/host/ -- o instalador (install-mac.sh /
-  // install-windows.ps1) sempre clona o repo ali, mesmo caminho de onde o venv sai.
-  var LOCAL_TRANSCRIBE_CANDIDATES = [
-    path.join(HOME, "viralcut", "premiere-panel", "host", "local_transcribe.py"),
-    path.join(__dirname, "..", "host", "local_transcribe.py"), // se __dirname = client/
-    path.join(__dirname, "host", "local_transcribe.py"),        // se __dirname = raiz da extensao
-    "/Applications/CLAUDE CODE/Projetos/VIRALCUT/premiere-panel/host/local_transcribe.py" // legado (Mac do dono)
-  ];
+  // Caminho REAL da extensao via API oficial do CEP -- infalivel, ao contrario do
+  // __dirname (que dentro do painel Adobe as vezes resolve pra raiz errada e fazia
+  // o caminho virar .../extensions/host/ sem o VIRALCUT/). getSystemPath("extension")
+  // retorna exatamente a pasta desta extensao; o local_transcribe.py e SEMPRE
+  // copiado pra <extensao>/host/ pelo install-premiere.sh, entao aqui nunca falha.
+  function cepExtensionPath() {
+    try {
+      if (typeof window !== "undefined" && window.__adobe_cep__ && window.__adobe_cep__.getSystemPath) {
+        var p = window.__adobe_cep__.getSystemPath("extension");
+        if (p) {
+          p = String(p).replace(/^file:\/\//, "");   // as vezes vem como URL file://
+          try { p = decodeURIComponent(p); } catch (e) {}
+          return p;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // Candidatos, em ordem. O 1o (extensao via CEP) e o caminho definitivo; os
+  // demais sao fallback para clones/instalacoes alternativas.
+  function localTranscribeCandidates() {
+    var ext = cepExtensionPath();
+    var list = [];
+    if (ext) list.push(path.join(ext, "host", "local_transcribe.py"));   // definitivo
+    list.push(path.join(HOME, "viralcut", "premiere-panel", "host", "local_transcribe.py"));
+    list.push(path.join(__dirname, "..", "host", "local_transcribe.py"));
+    list.push(path.join(__dirname, "host", "local_transcribe.py"));
+    list.push("/Applications/CLAUDE CODE/Projetos/VIRALCUT/premiere-panel/host/local_transcribe.py");
+    return list;
+  }
   // Raiz do repo (onde vive scripts/install-premiere.sh e o .git). MESMO problema
   // de __dirname nao confiavel dentro do CEP -- por isso os mesmos candidatos,
   // um nivel acima (premiere-panel/host/../.. = raiz do repo).
@@ -65,8 +83,9 @@
   }
 
   function findLocalTranscribeScript() {
-    for (var i = 0; i < LOCAL_TRANSCRIBE_CANDIDATES.length; i++) {
-      try { if (fs.existsSync(LOCAL_TRANSCRIBE_CANDIDATES[i])) return LOCAL_TRANSCRIBE_CANDIDATES[i]; } catch (e) {}
+    var cands = localTranscribeCandidates();
+    for (var i = 0; i < cands.length; i++) {
+      try { if (fs.existsSync(cands[i])) return cands[i]; } catch (e) {}
     }
     return null;
   }
@@ -216,7 +235,7 @@ REGRA ABSOLUTA: você NUNCA escreve timestamps. Apenas IDs de segmento. O códig
   async function transcribeLocal(audioPath, language) {
     var script = findLocalTranscribeScript();
     if (!script) {
-      throw new Error(INSTALL_HINT + "\n\n(procurei em: " + LOCAL_TRANSCRIBE_CANDIDATES.join(" | ") + ")");
+      throw new Error(INSTALL_HINT + "\n\n(procurei em: " + localTranscribeCandidates().join(" | ") + ")");
     }
     var candidates = pythonCandidates();
     for (var i = 0; i < candidates.length; i++) {
